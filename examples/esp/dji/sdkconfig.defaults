@@ -1,0 +1,5 @@
+CONFIG_CAN_TWAI=y
+CONFIG_ESC_C620=y
+CONFIG_ESC_GM6020=y
+# 1 kHz tick, so vTaskDelay(pdMS_TO_TICKS(1)) is the 1 ms period
+CONFIG_FREERTOS_HZ=1000
