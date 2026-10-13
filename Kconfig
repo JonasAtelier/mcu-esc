@@ -1,0 +1,62 @@
+# Read by ESP-IDF as a component Kconfig, and by both forges' `make menu`
+# (scripts/menu.py) for the ESC_<MODEL> prompts. stm-forge has no Kconfig
+# build step: its build only sees the defconfig lines, as
+# -DCONFIG_ESC_<MODEL>=1 or 0. Every model is off unless set.
+menuconfig ESC
+    bool "Brushless motor driver (ESC) subsystem"
+    default y
+    help
+        Brushless motor drivers that take a command and return feedback
+        where they have it, including motors with the driver built in
+        (GM6020, HT-03). Steppers are mcu-stepper's; hobby servos and the
+        PCA9685 are out of scope. The core: struct esc_dev,
+        esc_set_command(), esc_get_feedback() and the esc_* log helpers.
+        Pick the models you need below; none is built by default. The CAN
+        models need mcu-can.
+
+if ESC
+
+    config ESC_C610
+        bool "DJI RoboMaster C610 (CAN, M2006)"
+        default n
+        help
+            Build the DJI CAN driver with the C610: dji_add() with
+            DJI_MODEL_C610.
+
+    config ESC_C620
+        bool "DJI RoboMaster C620 (CAN, M3508)"
+        default n
+        help
+            Build the DJI CAN driver with the C620: dji_add() with
+            DJI_MODEL_C620. Links next to esp-c620-control.
+
+    config ESC_GM6020
+        bool "DJI RoboMaster GM6020 (CAN, driver built in)"
+        default n
+        help
+            Build the DJI CAN driver with the GM6020, in voltage or current
+            mode: dji_add() with DJI_MODEL_GM6020.
+
+    config ESC_C615
+        bool "DJI RoboMaster C615 (PWM)"
+        default n
+        help
+            Build the C615 driver: c615_init() and friends, on an LEDC
+            channel on ESP-IDF or a TIM channel on the STM32 HAL (needs
+            HAL_TIM_MODULE_ENABLED).
+
+    config ESC_HT03
+        bool "Haitai HT-03 (CAN, MIT Mini Cheetah protocol)"
+        default n
+        help
+            Build the HT-03 driver: ht03_init() and friends, esp-HT03's
+            calls on struct can_dev.
+
+    config ESC_DEBUG
+        bool "esc_dbg() lines"
+        default n
+        help
+            STM32 HAL only: compile esc_dbg() lines in. On ESP-IDF
+            esc_dbg() is ESP_LOGD and the log level decides.
+
+endif # ESC
