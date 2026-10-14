@@ -237,3 +237,34 @@ HAL_TIM_PWM_Stop(TIM_HandleTypeDef *htim, uint32_t Channel)
 	(void)Channel;
 	abort();
 }
+
+__attribute__((weak)) HAL_DMA_StateTypeDef
+HAL_DMA_GetState(DMA_HandleTypeDef *hdma)
+{
+	(void)hdma;
+	abort();
+}
+
+__attribute__((weak)) HAL_StatusTypeDef
+HAL_TIM_DMABurst_MultiWriteStart(TIM_HandleTypeDef *htim,
+				 uint32_t BurstBaseAddress,
+				 uint32_t BurstRequestSrc,
+				 const uint32_t *BurstBuffer, uint32_t BurstLength,
+				 uint32_t DataLength)
+{
+	(void)htim;
+	(void)BurstBaseAddress;
+	(void)BurstRequestSrc;
+	(void)BurstBuffer;
+	(void)BurstLength;
+	(void)DataLength;
+	abort();
+}
+
+__attribute__((weak)) HAL_StatusTypeDef
+HAL_TIM_DMABurst_WriteStop(TIM_HandleTypeDef *htim, uint32_t BurstRequestSrc)
+{
+	(void)htim;
+	(void)BurstRequestSrc;
+	abort();
+}

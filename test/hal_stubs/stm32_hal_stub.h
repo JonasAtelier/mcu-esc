@@ -150,9 +150,61 @@ typedef struct {
 	uint32_t CCR1, CCR2, CCR3, CCR4;
 } TIM_TypeDef;
 
+/*
+ * DMA: the handle's settings the DShot port checks and its state, values
+ * from stm32f4xx_hal_dma.h (F4 HAL v1.8.5) and the F405 CMSIS header's
+ * DMA_SxCR bits.
+ */
+typedef struct {
+	uint32_t Direction;
+	uint32_t PeriphInc;
+	uint32_t MemInc;
+	uint32_t PeriphDataAlignment;
+	uint32_t MemDataAlignment;
+	uint32_t Mode;
+} DMA_InitTypeDef;
+
+typedef enum {
+	HAL_DMA_STATE_RESET = 0x00U,
+	HAL_DMA_STATE_READY = 0x01U,
+	HAL_DMA_STATE_BUSY = 0x02U,
+} HAL_DMA_StateTypeDef;
+
+typedef struct {
+	DMA_InitTypeDef Init;
+	HAL_DMA_StateTypeDef State;
+} DMA_HandleTypeDef;
+
+#define DMA_MEMORY_TO_PERIPH		0x00000040U
+#define DMA_PINC_DISABLE		0x00000000U
+#define DMA_PINC_ENABLE			0x00000200U
+#define DMA_MINC_ENABLE			0x00000400U
+#define DMA_PDATAALIGN_HALFWORD		0x00000800U
+#define DMA_PDATAALIGN_WORD		0x00001000U
+#define DMA_MDATAALIGN_WORD		0x00004000U
+#define DMA_NORMAL			0x00000000U
+#define DMA_CIRCULAR			0x00000100U
+
+HAL_DMA_StateTypeDef HAL_DMA_GetState(DMA_HandleTypeDef *hdma);
+
 typedef struct {
 	TIM_TypeDef *Instance;
+	DMA_HandleTypeDef *hdma[7];
 } TIM_HandleTypeDef;
+
+#define TIM_DMA_ID_UPDATE		((uint16_t)0x0000)
+#define TIM_DMABASE_CCR1		0x0000000DU
+#define TIM_DMA_UPDATE			0x00000100U	/* TIM_DIER_UDE */
+#define TIM_DMABURSTLENGTH_4TRANSFERS	0x00000300U
+
+HAL_StatusTypeDef HAL_TIM_DMABurst_MultiWriteStart(TIM_HandleTypeDef *htim,
+						   uint32_t BurstBaseAddress,
+						   uint32_t BurstRequestSrc,
+						   const uint32_t *BurstBuffer,
+						   uint32_t BurstLength,
+						   uint32_t DataLength);
+HAL_StatusTypeDef HAL_TIM_DMABurst_WriteStop(TIM_HandleTypeDef *htim,
+					     uint32_t BurstRequestSrc);
 
 #define TIM_CHANNEL_1		0x00000000U
 #define TIM_CHANNEL_2		0x00000004U

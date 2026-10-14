@@ -18,6 +18,7 @@
 #include "can.h"
 #include "c615.h"
 #include "dji.h"
+#include "dshot.h"
 #include "esc.h"
 #include "esc_log.h"
 #include "ht03.h"
@@ -34,10 +35,12 @@ int main(void)
 	struct c615_config c615 = { .min_us = C615_PULSE_MIN_US };
 	ht03_t ht;
 	ht03_range_t j6 = HT03_J6;
+	struct dshot_bus dshot;
 
 	(void)rm;
 	(void)bus;
 	(void)ht;
+	(void)dshot;
 	printf("test_names: %u %u %u %u %u %u %u %.1f: no clash\n",
 	       (unsigned)old_feedback.angle, (unsigned)old_frame.id,
 	       (unsigned)frame.id, (unsigned)feedback.has,

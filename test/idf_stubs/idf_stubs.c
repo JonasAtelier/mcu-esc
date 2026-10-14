@@ -8,6 +8,7 @@
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/ledc.h"
+#include "driver/rmt_tx.h"
 #include "driver/spi_master.h"
 #include "driver/uart.h"
 #include "esp_log.h"
@@ -296,6 +297,91 @@ ledc_stop(ledc_mode_t speed_mode, ledc_channel_t channel, uint32_t idle_level)
 	(void)speed_mode;
 	(void)channel;
 	(void)idle_level;
+	abort();
+}
+
+__attribute__((weak)) esp_err_t
+rmt_new_tx_channel(const rmt_tx_channel_config_t *config,
+		   rmt_channel_handle_t *ret_chan)
+{
+	(void)config;
+	(void)ret_chan;
+	abort();
+}
+
+__attribute__((weak)) esp_err_t rmt_del_channel(rmt_channel_handle_t channel)
+{
+	(void)channel;
+	abort();
+}
+
+__attribute__((weak)) esp_err_t rmt_enable(rmt_channel_handle_t channel)
+{
+	(void)channel;
+	abort();
+}
+
+__attribute__((weak)) esp_err_t rmt_disable(rmt_channel_handle_t channel)
+{
+	(void)channel;
+	abort();
+}
+
+__attribute__((weak)) esp_err_t
+rmt_transmit(rmt_channel_handle_t tx_channel, rmt_encoder_handle_t encoder,
+	     const void *payload, size_t payload_bytes,
+	     const rmt_transmit_config_t *config)
+{
+	(void)tx_channel;
+	(void)encoder;
+	(void)payload;
+	(void)payload_bytes;
+	(void)config;
+	abort();
+}
+
+__attribute__((weak)) esp_err_t
+rmt_tx_wait_all_done(rmt_channel_handle_t tx_channel, int timeout_ms)
+{
+	(void)tx_channel;
+	(void)timeout_ms;
+	abort();
+}
+
+__attribute__((weak)) esp_err_t
+rmt_new_sync_manager(const rmt_sync_manager_config_t *config,
+		     rmt_sync_manager_handle_t *ret_synchro)
+{
+	(void)config;
+	(void)ret_synchro;
+	abort();
+}
+
+__attribute__((weak)) esp_err_t
+rmt_del_sync_manager(rmt_sync_manager_handle_t synchro)
+{
+	(void)synchro;
+	abort();
+}
+
+__attribute__((weak)) esp_err_t rmt_sync_reset(rmt_sync_manager_handle_t synchro)
+{
+	(void)synchro;
+	abort();
+}
+
+__attribute__((weak)) esp_err_t
+rmt_new_copy_encoder(const rmt_copy_encoder_config_t *config,
+		     rmt_encoder_handle_t *ret_encoder)
+{
+	(void)config;
+	(void)ret_encoder;
+	abort();
+}
+
+__attribute__((weak)) esp_err_t rmt_del_encoder(rmt_encoder_handle_t encoder)
+{
+	(void)encoder;
 	abort();
 }
 

@@ -7,12 +7,16 @@ dependencies.lock
 docs/*.pdf
 test/test_dji_math
 test/test_ht03_math
+test/test_dshot_math
 test/test_names
 test/test_dji
 test/test_ht03
 test/esp/test_core
 test/esp/test_c615
+test/esp/test_dshot
+test/esp/test_dshot_nosync
 test/esp/test_port_esp
 test/stm/test_core
 test/stm/test_c615
+test/stm/test_dshot
 test/stm/test_port_stm

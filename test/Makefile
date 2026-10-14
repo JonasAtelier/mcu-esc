@@ -28,7 +28,7 @@ CPPFLAGS += -I../include -I../src $(addprefix -I,$(wildcard ../src/*/)) \
 # in fixtures/.
 
 MODELS := -DCONFIG_ESC_C610=1 -DCONFIG_ESC_C620=1 -DCONFIG_ESC_GM6020=1 \
-	  -DCONFIG_ESC_C615=1 -DCONFIG_ESC_HT03=1
+	  -DCONFIG_ESC_C615=1 -DCONFIG_ESC_HT03=1 -DCONFIG_ESC_DSHOT=1
 # What ESP-IDF passes: ESP_PLATFORM, and every model on.
 ESP_CPPFLAGS := -Iidf_stubs -DESP_PLATFORM $(MODELS)
 # What stm-forge passes: the family header the code includes, the HAL modules
@@ -37,6 +37,7 @@ STM_CPPFLAGS := -Ihal_stubs \
 		-DCMSIS_device_header='"stm32_hal_stub.h"' \
 		-DHAL_I2C_MODULE_ENABLED -DHAL_SPI_MODULE_ENABLED \
 		-DHAL_UART_MODULE_ENABLED -DHAL_TIM_MODULE_ENABLED \
+		-DHAL_DMA_MODULE_ENABLED \
 		$(MODELS) -DCONFIG_ESC_DEBUG=1
 
 # The core and the stubs every binary of a suite links.
@@ -47,11 +48,13 @@ STM_CORE := $(CORE) ../src/esc_port_stm.c hal_stubs/hal_stubs.c
 DJI  := ../src/dji/dji.c
 HT03 := ../src/ht03/ht03.c
 C615 := ../src/c615/c615.c
+DSHOT := ../src/dshot/dshot.c
 
-MATH_TESTS  := test_dji_math test_ht03_math test_names
+MATH_TESTS  := test_dji_math test_ht03_math test_dshot_math test_names
 MODEL_TESTS := test_dji test_ht03
-ESP_TESTS   := $(addprefix esp/,test_core test_c615 test_port_esp)
-STM_TESTS   := $(addprefix stm/,test_core test_c615 test_port_stm)
+ESP_TESTS   := $(addprefix esp/,test_core test_c615 test_dshot \
+		test_dshot_nosync test_port_esp)
+STM_TESTS   := $(addprefix stm/,test_core test_c615 test_dshot test_port_stm)
 TESTS       := $(MATH_TESTS) $(MODEL_TESTS) $(ESP_TESTS) $(STM_TESTS)
 
 .PHONY: all clean test
@@ -60,6 +63,7 @@ all: $(TESTS)
 
 test_dji_math: test_dji_math.c
 test_ht03_math: test_ht03_math.c
+test_dshot_math: test_dshot_math.c
 test_names: test_names.c
 test_names: CPPFLAGS += -Ifixtures
 
@@ -68,10 +72,14 @@ test_ht03: test_ht03.c $(HT03) $(ESP_CORE)
 
 esp/test_core: esp/test_core.c $(ESP_CORE)
 esp/test_c615: esp/test_c615.c $(C615) $(ESP_CORE)
+esp/test_dshot: esp/test_dshot.c $(DSHOT) $(ESP_CORE)
+esp/test_dshot_nosync: esp/test_dshot_nosync.c $(DSHOT) $(ESP_CORE)
+esp/test_dshot_nosync: CPPFLAGS += -DSTUB_RMT_NO_TX_SYNCHRO
 esp/test_port_esp: esp/test_port_esp.c $(ESP_CORE)
 
 stm/test_core: stm/test_core.c $(STM_CORE)
 stm/test_c615: stm/test_c615.c $(C615) $(STM_CORE)
+stm/test_dshot: stm/test_dshot.c $(DSHOT) $(STM_CORE)
 stm/test_port_stm: stm/test_port_stm.c $(STM_CORE)
 
 $(MATH_TESTS) $(MODEL_TESTS) $(ESP_TESTS): CPPFLAGS += $(ESP_CPPFLAGS)
