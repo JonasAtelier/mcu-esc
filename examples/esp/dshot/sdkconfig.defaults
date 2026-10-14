@@ -1,0 +1,3 @@
+CONFIG_ESC_DSHOT=y
+# 1 kHz tick, so vTaskDelay(pdMS_TO_TICKS(1)) is the 1 ms frame period
+CONFIG_FREERTOS_HZ=1000
