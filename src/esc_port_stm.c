@@ -21,7 +21,7 @@
  * model" warning on the ESP-IDF side.
  */
 #if !(CONFIG_ESC_C610 || CONFIG_ESC_C620 || CONFIG_ESC_GM6020 || \
-      CONFIG_ESC_C615 || CONFIG_ESC_HT03)
+      CONFIG_ESC_C615 || CONFIG_ESC_HT03 || CONFIG_ESC_DSHOT)
 #warning "esc: no model is selected; set ESC_<MODEL> = y under PKG_esc = y (or -DCONFIG_ESC_<MODEL>=1)"
 #endif
 

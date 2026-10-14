@@ -45,6 +45,16 @@ if ESC
             channel on ESP-IDF or a TIM channel on the STM32 HAL (needs
             HAL_TIM_MODULE_ENABLED).
 
+    config ESC_DSHOT
+        bool "DShot150/300/600 (any DShot ESC)"
+        default n
+        help
+            Build the DShot driver: dshot_init() and friends, up to four
+            motors on RMT TX channels on ESP-IDF, or on one timer and its
+            update DMA on the STM32 HAL (needs HAL_TIM_MODULE_ENABLED and
+            HAL_DMA_MODULE_ENABLED). Output only for now: bidirectional
+            DShot (eRPM back) is a later phase.
+
     config ESC_HT03
         bool "Haitai HT-03 (CAN, MIT Mini Cheetah protocol)"
         default n

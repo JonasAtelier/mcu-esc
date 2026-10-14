@@ -20,11 +20,13 @@
 # internal.h), and no global symbol either: an app links both.
 #
 # REQUIRES driver, not esp_driver_*: the split components do not exist on
-# IDF 5.2, and driver still pulls them in on later versions; LEDC is there.
+# IDF 5.2, and driver still pulls them in on later versions; LEDC and RMT
+# are there.
 set(srcs "src/esc.c" "src/esc_log.c" "src/esc_port_esp.c")
 
 if(CONFIG_ESC AND NOT (CONFIG_ESC_C610 OR CONFIG_ESC_C620 OR
-                       CONFIG_ESC_GM6020 OR CONFIG_ESC_C615 OR CONFIG_ESC_HT03))
+                       CONFIG_ESC_GM6020 OR CONFIG_ESC_C615 OR CONFIG_ESC_HT03 OR
+                       CONFIG_ESC_DSHOT))
     message(WARNING "esc: CONFIG_ESC is on but no model is selected; "
                     "set CONFIG_ESC_<MODEL>=y (esp-forge: ESC_<MODEL> = y)")
 endif()
@@ -34,6 +36,9 @@ if(CONFIG_ESC_C610 OR CONFIG_ESC_C620 OR CONFIG_ESC_GM6020)
 endif()
 if(CONFIG_ESC_C615)
     list(APPEND srcs "src/c615/c615.c")
+endif()
+if(CONFIG_ESC_DSHOT)
+    list(APPEND srcs "src/dshot/dshot.c")
 endif()
 if(CONFIG_ESC_HT03)
     list(APPEND srcs "src/ht03/ht03.c")
