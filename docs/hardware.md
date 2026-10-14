@@ -86,3 +86,86 @@ channel so a new pulse width starts at the next period.
 
 On ESP-IDF the C615 runs on any LEDC-capable pin, through one LEDC timer
 and channel per ESC; ESCs at one rate may share the timer.
+
+## DShot
+
+Each ESC's signal wire to one output, grounds common. The line rests low;
+every frame is 16 pulses of 3/4 or 3/8 of the bit ([model
+reference](chips.md#dshot)).
+
+**ESP-IDF (the S3 is the target).** One RMT TX channel per motor, any
+output-capable GPIO. The S3 has four TX channels with 48 symbols each and can
+start several at once (IDF v5.5.5 `soc/esp32s3/include/soc/soc_caps.h:282-291`),
+so four motors take all its TX channels; a frame is 16 symbols.
+
+**STM32 HAL.** One timer, up to its four channels, and the timer's update
+DMA: every update burst-writes CCR1-CCR4 (`TIM_DMABASE_CCR1`, 4 transfers),
+so four motors cost one DMA stream. The timer is the app's: prescaler and
+ARR so that one counter period is one bit, repetition counter 0,
+output-compare preload on the channels, the update DMA word-to-word in
+normal mode with its IRQ handled. A timer runs DShot or C615 PWM, not both.
+
+### On the Hawk flight controller
+
+| Motor | Pin | Timer | AF | Board | Source |
+|---|---|---|---|---|---|
+| M1 | PC6 | TIM8_CH1 | 3 | 47 R in series, 10 k pull-down | `hardware/hawk/control/GPIO.md` |
+| M2 | PC7 | TIM8_CH2 | 3 | the same | the same |
+| M3 | PC8 | TIM8_CH3 | 3 | the same | the same |
+| M4 | PC9 | TIM8_CH4 | 3 | the same | the same |
+
+TIM8 runs at 168 MHz on Hawk's clock tree (APB2 84 MHz, timers at twice
+that; `project/hawk/src/board.c:22-23, 50`), so with prescaler 0 a DShot600
+bit is ARR 279, DShot300 559, DShot150 1119. **TIM8_UP is DMA2 stream 1,
+channel 7**, its only stream (RM0090 Rev 3, Table 34 "DMA2 request mapping",
+p.217; `docs/rm0090.pdf`, gitignored); the library takes the app's DMA
+handle and never names it.
+
+**DMA streams on Hawk.** Table 34 gives the requests TIM8 and the IMU's SPI1
+could use:
+
+| Request | DMA2 stream / channel | Needed by |
+|---|---|---|
+| TIM8_UP | 1 / 7 | DShot, now |
+| TIM8_CH1 | 2 / 7, or 2 / 0 | bidirectional capture, phase 2 |
+| TIM8_CH2 | 3 / 7, or 2 / 0 | the same |
+| TIM8_CH3 | 4 / 7, or 2 / 0 | the same |
+| TIM8_CH4 | 7 / 7 (shared with TIM8_TRIG, TIM8_COM) | the same |
+| SPI1_RX | 0 / 3, or 2 / 3 | the IMU, if its SPI1 ever moves to DMA |
+| SPI1_TX | 3 / 3, or 5 / 3 | the same |
+
+A stream serves one channel at a time (9.3.3, p.216). Hawk's firmware uses
+no DMA today -- SPI1 is polled (`project/hawk/src`, no DMA call) -- so
+nothing competes with stream 1 now. **No collision with SPI1, now or in
+phase 2, provided SPI1 takes stream 0 for RX and stream 5 for TX**: TIM8's
+update and its four captures need streams 1, 2, 3, 4 and 7, and SPI1's
+other choices, 2 and 3, are exactly the CH1 and CH2 captures'. Stream 2
+channel 0 can carry CH1, CH2 or CH3, but only one at a time, so it does not
+replace three streams.
+
+**Hawk cannot run DShot as built.** Its four ESCs are DJI C615s, which take
+PWM only: the C615 guide lists 400-2200 us and at most 500 Hz and never
+mentions DShot, and `GPIO.md` marks TIM8 "DJI C615 PWM (no DShot)". DShot on
+Hawk means other ESCs on the same headers.
+
+**Bidirectional DShot needs a board change too.** Its line rests high and
+the ESC drives the reply ([BW] "Bidirectional DSHOT"); the 10 k pull-downs
+on PC6-PC9 pull the other way while nobody drives it. They have to become
+pull-ups, or go, before bidirectional DShot can work there.
+
+### What bidirectional DShot (phase 2) will cost
+
+- **ESP32-S3:** one RMT RX channel per motor on the same GPIO as its TX
+  (`io_loop_back` with `io_od_mode`, `invert_out`/`invert_in`;
+  `driver/rmt_tx.h:43-46`, `driver/rmt_rx.h:42-44`) -- all four of the
+  S3's RX channels for four motors. Per frame and motor: arm a receive before
+  sending, then two interrupts (TX done, RX done), and a few microseconds to
+  decode 21 bits.
+- **STM32F4:** after each frame every channel turns from output to input
+  capture inside the reply window and back, and each captures its edges
+  through its own DMA request (TIM8_CH1-4) on top of the update stream:
+  five of DMA2's eight streams for four motors, CCMR/CCER rewritten twice a
+  frame -- or one motor read per frame in turn, at a quarter of the eRPM
+  rate. On TIM8 those requests are DMA2 streams 2, 3, 4 and 7, channel 7,
+  besides the update's stream 1 (table above): five of DMA2's eight, none
+  shared.

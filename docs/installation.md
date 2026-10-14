@@ -45,6 +45,7 @@ ESC_C620            = y
 # ESC_C610 is not set
 # ESC_GM6020 is not set
 # ESC_C615 is not set
+# ESC_DSHOT is not set
 # ESC_HT03 is not set
 # ESC_DEBUG is not set
 ```
@@ -112,10 +113,12 @@ the library on and no model picked, `src/esc_port_stm.c` emits a
 | Model | Needs in hal_conf | HAL source | Gives |
 |---|---|---|---|
 | C615 | `HAL_TIM_MODULE_ENABLED` | `stm32<family>xx_hal_tim.c` | `c615_init()` |
+| DShot | `HAL_TIM_MODULE_ENABLED`, `HAL_DMA_MODULE_ENABLED` | `stm32<family>xx_hal_tim.c`, `_dma.c` | `dshot_init()` |
 | C610, C620, GM6020, HT-03 | what mcu-can's controller needs | -- | `dji_*`, `ht03_*` |
 
 Without the TIM module, a C615 build stops with an `#error` in
-`src/esc_priv.h` (and in `c615.h`).
+`src/esc_priv.h` (and in `c615.h`); without TIM and DMA, a DShot build does
+the same (and in `dshot.h`). stm-forge's `mcu/stm32f4.cmake` lists both.
 
 **printf() is the log.** Lines go out through `printf()`, so retarget
 newlib's `_write()` to a UART.

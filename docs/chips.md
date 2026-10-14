@@ -126,3 +126,125 @@ matches.
 
 Some HT-03 documents call the reply's torque field a current, +-40 A; the
 firmware's line above makes it newton metres, and so does mcu-esc.
+
+## DShot
+
+There is no official DShot specification. These are the sources, none of
+them in the repository; read on 2026-10-14:
+
+| Short | Document | Where |
+|---|---|---|
+| BW | Chris Landa, "DSHOT - the missing Handbook", 2021-02-27 | https://brushlesswhoop.com/dshot-and-bidirectional-dshot/ |
+| BLH | BLHeli_32 `Digital_Cmd_Spec.txt` | https://raw.githubusercontent.com/bitdump/BLHeli/master/BLHeli_32%20ARM/BLHeli_32%20Firmware%20specs/Digital_Cmd_Spec.txt |
+| EDT | Extended DShot Telemetry specification, README | github.com/bird-sanctuary/extended-dshot-telemetry @ `438b87983b58369e3e46068b0b975634f4ea5416` |
+| BF | Betaflight `src/main/drivers/dshot.c` -- GPL, read for facts only, nothing copied | github.com/betaflight/betaflight @ `4b7fa8e40a562a20b328fc50bd8829d6bded08eb` |
+| IDF | ESP-IDF v5.5.5 `examples/peripherals/rmt/dshot_esc` (Apache-2.0), a cross-check | `~/esp-idf` |
+| RM0090 | ST RM0090 Rev 3, STM32F40x/41x/42x/43x reference manual (Doc ID 018909): the timer DMA burst, the DMA2 request mapping | `docs/rm0090.pdf` (gitignored) |
+| Bluejay | github.com/bird-sanctuary/bluejay @ `0368d114b72f3939ea49c671b199bf0d13d9079d`: only that it supports DShot 300 and 600 and bidirectional DShot (README) | |
+
+The constants are in `src/dshot/dshot_proto.h`, the arithmetic in
+`src/dshot/dshot_math.h`; `test/test_dshot_math.c` holds both to the
+sources' own worked examples.
+
+### The frame
+
+| What | Value | Source |
+|---|---|---|
+| Frame | 16 bits, most significant first: 11-bit value, telemetry bit, 4-bit CRC (`SSSSSSSSSSSTCCCC`) | BW "Frame Structure" |
+| Values | 0 disarmed (motor stop), 1-47 special commands, 48-2047 throttle | BW "Frame Structure" |
+| CRC | `(d ^ (d >> 4) ^ (d >> 8)) & 0x0F`, d the 12 bits before it; 1046 without telemetry is `1000001011000110` | BW "Calculating the CRC"; IDF `dshot_esc_encoder.c:41` |
+| CRC, bidirectional | the same, inverted before the mask: `1000001011001001` | BW "Bidirectional DSHOT" |
+| Bit timing | a 1 high for 3/4 of the bit, a 0 for 3/8: DShot150 bit 6.67 us, T1H 5.00, T0H 2.50; DShot300 3.33, 2.50, 1.25; DShot600 1.67, 1.25, 0.625 | BW "Frame Structure" table; IDF uses 0.7485 and 0.37425 (`:132-134`) |
+| Frame time | 16 bit periods: 106.72, 53.28, 26.72 us | BW table |
+| Arming | most firmware wants value 0 for a while first; 300 ms on Bluejay | BW "Arming sequence" |
+
+**Frame gap.** No source gives a minimum gap between frames: [BW] has the
+flight controller send one frame per control loop. The library sends one
+per `dshot_update()` and refuses (`-EBUSY`) while the last one is still on
+the wire; on the STM32 a row of zeros after bit 15 returns the line low.
+
+**The STM32's burst** [RM0090]. The update DMA writes the timer's DMAR,
+which lands on CR1 + (DCR.DBA + index) x 4 (14.4.20, p.415). DBA is the
+first register as a word offset from CR1 and DBL the count less one
+(14.4.19, p.414); CCR1-CCR4 are at 0x34-0x40 (Table 72, p.417), so DBA 13
+and DBL 3 write all four compares per update. The DMA's count is every word
+of every update -- 17 rows of 4, 68 -- in normal mode, as the manual's own
+example has it (p.415). Word writes are allowed (14.4, p.390). With OCxPE
+set, a compare takes effect at the next update (14.4.7, p.402), so each
+row is one bit, one period later. On the F405, TIM8_UP is DMA2 stream 1,
+channel 7 (Table 34, p.217).
+
+**What mcu-esc picks.** On ESP-IDF the RMT runs at 8 MHz, which divides
+every chip's default RMT clock -- 80 MHz on the ESP32, S2, S3, C3, C5, C6
+and P4, the H2's 32 MHz crystal (`RMT_CLK_SRC_DEFAULT`,
+`soc/<chip>/include/soc/clk_tree_defs.h`, IDF v5.5.5) -- so no chip gets
+another resolution than asked:
+
+| Rate | Bit | vs [BW] | 1 high | 0 high |
+|---|---|---|---|---|
+| DShot150 | 53 ticks, 6.625 us | 6.67 us, -0.7 % | 40, 5.000 us | 20, 2.500 us |
+| DShot300 | 27 ticks, 3.375 us | 3.33 us, +1.3 % | 20, 2.500 us | 10, 1.250 us |
+| DShot600 | 13 ticks, 1.625 us | 1.67 us, -2.5 % | 10, 1.250 us | 5, 0.625 us |
+
+The highs, which tell a 1 from a 0, are [BW]'s exactly; the bit period is
+off by the rounding shown. No source gives a tolerance for either. On the
+STM32 one counter period is one bit, the app's ARR; Hawk's 168 MHz TIM8
+gives 1120, 560 and 280 ticks, exact.
+
+**Which ESP chips.** DShot needs an RMT (`SOC_RMT_SUPPORTED`): the ESP32,
+S2, S3, C3, C5, C6, H2 and P4 have one, the C2 and C61 do not -- there
+`ESC_DSHOT` stops the build with an `#error`. Several motors need the RMT
+to start channels together (`SOC_RMT_SUPPORT_TX_SYNCHRO`), which the
+original ESP32 lacks: on it `count` above 1 is `-EOPNOTSUPP`, one motor
+works. (`soc/<chip>/include/soc/soc_caps.h`, IDF v5.5.5.)
+
+### Special commands
+
+Every command frame has the telemetry bit set, with throttle zero [BLH line
+30]; 0-36 are executed only with the motor stopped [BW], so `dshot_command()`
+refuses them while the motor's value is not 0. After a command, the motor is
+held at value 0 for the wait below, counted in `dshot_update()`'s `dt_s`.
+
+| Number | Command | Frames | Then wait | Source |
+|---|---|---|---|---|
+| 1, 2 | BEEP1, BEEP2 | 1 | 260 ms | BLH 2-3 |
+| 3, 4 | BEEP3, BEEP4 | 1 | 280 ms | BLH 4-5 ([BW] says 260) |
+| 5 | BEEP5 | 1 | 1020 ms | BLH 6 ([BW] says 260) |
+| 6 | ESC_INFO | 1 | 12 ms | BLH 7 |
+| 7, 8 | SPIN_DIRECTION_1, _2 | 6 | -- | BLH 8-9 |
+| 9, 10 | 3D_MODE_OFF, _ON | 6 | -- | BLH 10-11 |
+| 11 | SETTINGS_REQUEST ("not implemented") | 1 | -- | BLH 12 |
+| 12 | SAVE_SETTINGS | 6 | 35 ms | BLH 13 |
+| 13, 14 | EXTENDED_TELEMETRY_ENABLE, _DISABLE | 6 | 35 ms | BLH 14-15; EDT "Enabling EDT" |
+| 20, 21 | SPIN_DIRECTION_NORMAL, _REVERSED | 6 | -- | BLH 16-17 |
+| 22-29 | LED0-3 on, off | 1 | -- | BLH 18-25 |
+| 30, 31 | audio stream, silent mode ("not implemented") | 1 | -- | BLH 26-27 |
+| 32-35 | signal-line telemetry off, on, continuous eRPM, continuous eRPM period | 6 | -- | BW |
+| 42-47 | signal-line temperature, voltage, current, consumption, eRPM, eRPM period | 1 | -- | BW |
+
+15-19, 36-41 and anything past 47 have no meaning: `-EINVAL`. [BLH] adds
+that "a significant delay (several hundred ms) may be needed between
+commands" (line 31); that is the app's to add. Betaflight sends 10 repeats
+rather than 6, 1 ms apart [BF `dshot_command.c:39, 191-205`]; mcu-esc sends the
+6 the specification asks for, one per `dshot_update()`.
+
+### Bidirectional DShot: designed in, phase 2
+
+What is decoded already, in `dshot_math.h`, host-tested:
+
+| What | Value | Source |
+|---|---|---|
+| Line | inverted: idle high; the ESC answers on the same wire, about 30 us after each frame | BW "Bidirectional DSHOT" |
+| Rates | DShot300 and up only | BW |
+| Reply | 21 bits at 5/4 of the bit rate: a 0, then 20 GCR bits sent as changes of level (a 1 toggles) | BW "eRPM Transmission" |
+| GCR | nibble 0-F to 19 1B 12 13 1D 15 16 17 1A 09 0A 0B 1E 0D 0E 0F; decode `gcr = raw ^ (raw >> 1)` | BW "eRPM Transmission", "Decoding" |
+| Frame | `eeemmmmmmmmmcccc`: period in us = m << e; CRC the plain one | BW "eRPM Telemetry Frame"; EDT "Checksum"; BF `dshot.c:214` |
+| Stopped | data `0x0FFF` | BF `dshot.c:209-211` |
+| eRPM | 60 000 000 / period, rounded (one electrical turn per period) | arithmetic |
+| EDT | with EDT on, a prefix (bits 11-8) other than 0 and bit 8 clear is an EDT frame: type in bits 11-9 (001 temperature in deg C, 010 voltage in 0.25 V, 011 current in A, ...), value in 7-0 | EDT "eRPM Frames", "EDT Frames" |
+
+What phase 2 adds is the capture and the line turnaround -- see
+[hardware.md](hardware.md#dshot) for what it costs on each platform.
+`dshot_config.bidirectional` is `-EOPNOTSUPP` until then, and
+`esc_get_feedback()` too; it will become `ESC_HAS_VELOCITY` from eRPM over
+the motor's pole pairs.

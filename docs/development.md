@@ -13,30 +13,34 @@ include/                    public API, the only directory apps include
   dji.h                     C610, C620, GM6020: struct dji_bus, dji_*()
   ht03.h                    esp-HT03's API on struct can_dev, ht03_esc()
   c615.h                    struct c615 and its config, struct esc_pwm, c615_*()
+  dshot.h                   struct dshot_bus and its config, struct dshot_port, dshot_*()
 src/                        private to the library
   esc.c                     the core: the command and feedback checks
   esc_log.c                 esc_log_feedback()
-  esc_priv.h                bus ops, attach and probe, errno map, the PWM port
-  esc_port_esp.c            all of that on ESP-IDF (LEDC); empty elsewhere
-  esc_port_stm.c            all of that on the STM32 HAL (TIM); empty under ESP-IDF
+  esc_priv.h                bus ops, attach and probe, errno map, the PWM and DShot ports
+  esc_port_esp.c            all of that on ESP-IDF (LEDC, RMT); empty elsewhere
+  esc_port_stm.c            all of that on the STM32 HAL (TIM, TIM DMA burst); empty under ESP-IDF
   dji/                      dji.c  dji_proto.h  dji_math.h
   ht03/                     ht03.c  ht03_math.h
   c615/                     c615.c
+  dshot/                    dshot.c  dshot_proto.h  dshot_math.h
 test/                       host tests, `make -C test test`
   test_dji_math.c           the DJI conversions against the manuals' numbers
   test_ht03_math.c          esp-HT03's test_pack.c: layout, scaling, clamping
+  test_dshot_math.c         DShot frames, CRCs, timing, throttle and the reply against the sources' examples
   test_names.c              rm.h, hvd230can.h, upid.h and every header here in one file
   test_dji.c                dji.c on a fake can_send()
   test_ht03.c               esp-HT03's test_core.c on a fake can_send(), and the esc_dev
   core_cases.h              core cases, shared by esp/ and stm/
   c615_cases.h              C615 cases, shared by esp/ and stm/
-  esp/                      suites on idf_stubs/, through esc_port_esp.c, a fake LEDC
-  stm/                      suites on hal_stubs/, through esc_port_stm.c, a fake TIM
+  dshot_cases.h             DShot cases, shared by esp/ and stm/
+  esp/                      suites on idf_stubs/, through esc_port_esp.c, a fake LEDC and RMT
+  stm/                      suites on hal_stubs/, through esc_port_stm.c, a fake TIM and DMA
   idf_stubs/  hal_stubs/    the slice of ESP-IDF and of the HAL the code calls
   fixtures/                 verbatim copies of rm.h, hvd230can.h, upid.h for test_names
 examples/
-  esp/<name>/               ESP-IDF projects: dji, ht03, c615
-  stm/<name>/               STM32 snippets: dji_bxcan, c615
+  esp/<name>/               ESP-IDF projects: dji, ht03, c615, dshot
+  stm/<name>/               STM32 snippets: dji_bxcan, c615, dshot
 docs/                       the five guides; the manuals here are gitignored
 CMakeLists.txt              ESP-IDF only; stm-forge globs src/**/*.c instead
 Kconfig                     ESC and ESC_<MODEL>, for ESP-IDF and both forges' menus
@@ -103,6 +107,23 @@ writes compare 0 before the channel goes off, so the pin is low whatever
 the stopped channel's idle state. The struct lives in `c615.h`, its only
 user, so the app can place a `struct c615`.
 
+**The DShot port** is `struct dshot_port` and `esc_dshot_attach/busy/send/
+detach()`; `dshot.c` above it is the same C on both platforms and knows
+frames, commands and waits, nothing of pulses. On ESP-IDF it is one RMT TX
+channel per motor at 8 MHz, a copy encoder each, and a sync manager over
+them for more than one motor, reset before every frame as IDF asks; if a
+send fails part-way, the channels that already took a frame are disabled
+and enabled again and the sync reset, or they would wait for the rest
+forever. The port exists only where `SOC_RMT_SUPPORTED`; the 16
+symbols of a frame stay in the port while the encoder may still read them,
+and `rmt_tx_wait_all_done(..., 0)` is the busy test. On the HAL it is the
+app's timer, one bit per period, and its update DMA burst-writing CCR1-CCR4
+from a 17-row buffer, the last row zeros so the line ends low; the HAL
+leaves its burst state busy after a transfer, so every send stops the last
+burst first, and the DMA handle's state, which the app's IRQ handler
+returns to ready, is the busy test. `struct dshot_port` lives in `dshot.h`
+so the app can place a `struct dshot_bus`.
+
 ## Bus abstraction
 
 The bus layer is mcu-gamecontroller's: `struct esc_bus_ops` with
@@ -149,7 +170,9 @@ Each change is checked by a test that fails without it: 91 mutations of the
 source were run, each on a scratch copy; 89 fail the suite. The two that
 survive drop the cap on the time since the last frame, in `dji.c` and in
 esp-HT03's `ht03.c` alike, which only keeps a float from growing while a
-motor stays unplugged -- not something a host test can see.
+motor stays unplugged -- not something a host test can see. DShot had its
+own pass: 69 mutations of `dshot.c`, `dshot_math.h`, `dshot_proto.h` and
+both ports' DShot halves, all 69 failing the suite.
 
 | Binary | Checks |
 |---|---|
@@ -160,16 +183,20 @@ motor stays unplugged -- not something a host test can see.
 | `test_ht03` | esp-HT03's test_core.c on errno and `can_dev`: slots, special commands and their wait, set zero not sent when the exit fails, reply matching, DLC 6 and the F446 rewrite's 7 heard, 5 and 8 refused, offline and limp, a send error before offline; the `esc_dev`: torque only, the whole command replaced, feedback bits |
 | `esp/test_core`, `stm/test_core` | the kind, value and `commands` checks before the op; the op's error passed through; feedback zeroed for the op and untouched on failure; `-EOPNOTSUPP` without `get_feedback`; the log line |
 | `esp/test_c615`, `stm/test_c615` | refused endpoints, rates and a `max_us` that fills the period; nothing running after a failed init; throttle 0, 0.5, 1, clamped, rounded to the microsecond; the raw pulse inside the endpoints; del and after. ESP-IDF: the LEDC timer and channel settings, **the duty to the step at 400 and 50 Hz**, the stop level. HAL: **the rate from ARR**, the compare at 1, 84 and 1.5 MHz, the compare 0 before stop, refused handles and channels, a 32-bit ARR that wraps |
+| `test_dshot_math` | **[BW]'s worked frame 1046 both ways, `0x82C6` and `0x82C9`**; frames for 0, 48, 2047 and a command, with and without the bit; **bit and high ticks at 40 and 168 MHz against [BW]'s table**, rounding at 100 MHz; throttle 0, the bottom, half, the top, past it; **the reply: [BW]'s GCR example and its worst case, any leading level, quintets outside the table, a wrong or inverted CRC**; every table entry; the period m << e, [EDT]'s 512, 0x0FFF as stopped, period 0 refused, eRPM rounding; EDT against eRPM by prefix |
+| `esp/test_dshot`, `stm/test_dshot` | refused counts, speeds and bidirectional; **every motor's frame read back from its pulses**: throttle, raw values, the telemetry bit held and one-shot; **every command with a meaning: its frame count with the bit, the wait after it counted in dt_s, refused while running for 0-36 and taken for 42-47**, refused numbers, another model's `esc_dev`; **raw values 1-47 refused**; a busy line consuming nothing; **a failed send consuming no repeat, no wait, no one-shot bit**; del. ESP-IDF: **each channel at 8 MHz, 48 symbols, queue 1, every symbol one bit**, the sync manager over all channels and reset each frame, none for one motor, a pin below 0, **every setup call failing in turn leaving nothing allocated**, **a transmit failing on the third motor: the first two stopped and re-enabled, the sync reset, the next update going**; `esp/test_dshot_nosync`, the original ESP32's RMT: one motor works, more is `-EOPNOTSUPP`. HAL: **the burst into CCR1, 4 transfers, 68 words, stop before start**, the zero row, motors on channels out of order and an unused slot left 0, compares 0 at init and del, **every wrong DMA setting, channel and ARR refused**, ticks that do not divide, a channel that will not start stopping the others |
 | `esp/test_port_esp`, `stm/test_port_stm` | the bus layer, as in every category library |
 
 All build under `-std=gnu11 -Wall -Wextra -Werror -pedantic` with UBSan, and
 `-Wl,--wrap` (GNU ld) to capture `printf()` on the HAL side.
 
-**Builds.** The three ESP-IDF examples build for esp32s3 on ESP-IDF v5.5.5
-with no warning. A scratch app with esp-c620-control, esp-sn65hvd230-can,
+**Builds.** The ESP-IDF examples build for esp32s3 on ESP-IDF v5.5.5 with
+no warning; since DShot, so does `examples/esp/dshot`, and a copy of it with
+every model and the TWAI on, which compiles every source of the library. A scratch app with esp-c620-control, esp-sn65hvd230-can,
 mcu-can and mcu-esc, every model on, links; `nm -g --defined-only` over the
 four component archives finds no symbol defined by two of them. On
 stm-forge, a scratch STM32F405 target with mcu-can (`CAN_BXCAN`), every
 model on and Hawk's HAL conf plus the CAN module, links each of
 `examples/stm/dji_bxcan` and `examples/stm/c615` against STM32CubeF4 HAL
-v1.8.5, with no warning from either library.
+v1.8.5, with no warning from either library; `examples/stm/dshot` links
+the same way with DShot alone, with the C615, and with every model on.

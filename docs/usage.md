@@ -22,7 +22,7 @@ Each model hands out one `struct esc_dev *` per motor:
 |---|---|---|
 | `ESC_COMMAND_CURRENT` | amperes of torque current | C610, C620, GM6020 in current mode |
 | `ESC_COMMAND_TORQUE` | newton metres at the output | HT-03 |
-| `ESC_COMMAND_THROTTLE` | 0..1 of the calibrated range | C615 |
+| `ESC_COMMAND_THROTTLE` | 0..1 of the calibrated range; DShot: 0 stop, then 48..2047 | C615, DShot |
 
 `esc->commands` holds the kinds a motor takes, as `ESC_COMMAND_BIT(kind)`.
 
@@ -139,15 +139,51 @@ channel (CCMRx OCxPE): the library writes the compare whenever a command
 comes, and without preload a write in the middle of a period takes effect
 at once, so the pulse in flight can come out short or doubled.
 
+## DShot
+
+```c
+static struct dshot_bus bus;
+struct dshot_config cfg = {
+    .speed = DSHOT_600, .count = 4,
+    .gpio = { 4, 5, 6, 7 },                 /* STM32: .tim, .tick_hz, .channel */
+};
+
+dshot_init(&bus, &cfg);                     /* lines low, nothing sent yet */
+/* every control period, value 0 for a while first so the ESCs arm */
+esc_set_command(dshot_esc(&bus, 0), ESC_COMMAND_THROTTLE, t);
+dshot_update(&bus, dt_s);                   /* one frame to every motor */
+```
+
+| Call | Does |
+|---|---|
+| `dshot_init(&bus, &cfg)` | checks the config and sets the outputs up; `-EOPNOTSUPP` for `bidirectional` |
+| `dshot_esc(&bus, i)` | motor i's `esc_dev`; NULL past `count` |
+| `dshot_update(&bus, dt_s)` | one frame to every motor, together; `dt_s` counts down a command's wait. `-EBUSY`, sending nothing, while the last frame is still on the wire |
+| `dshot_command(esc, cmd)` | a special command: its frames with the telemetry bit, then value 0 for its wait ([model reference](chips.md#special-commands)); `-EBUSY` while one is still going, or for 0-36 while the motor runs |
+| `dshot_set_value(esc, v, telemetry)` | the raw value, 0 or 48-2047 -- 3D mode's halves, say; the bit stays on until the next throttle. 1-47 are `-EINVAL`: commands go through `dshot_command()` |
+| `dshot_request_telemetry(esc)` | the bit in the next frame only |
+| `dshot_del(&bus)` | outputs stopped, lines low |
+
+Throttle 0 is value 0, motor stop; any throttle above 0 is 48..2047,
+linear, rounded. The library sends nothing between two updates: call
+`dshot_update()` at the loop rate, no faster than a frame lasts (106.72,
+53.28 or 26.72 us). ESP-IDF needs a chip with an RMT -- not the C2 -- and
+for more than one motor one that starts channels together -- not the
+original ESP32 ([model reference](chips.md#dshot)); the STM32 a
+timer and its update DMA set up as `dshot.h` describes, the DMA's IRQ
+calling `HAL_DMA_IRQHandler()` -- the library sees a frame finished only
+through the HAL's DMA state.
+
 ## Errors
 
 | errno | Means |
 |---|---|
 | `-EINVAL` | a bad argument: NULL, an ID out of range, a value not finite, a bad config |
-| `-EOPNOTSUPP` | a command kind the model does not take, feedback from a C615, a model built out |
+| `-EOPNOTSUPP` | a command kind the model does not take, feedback from a C615 or DShot, a model built out, bidirectional DShot |
 | `-EADDRINUSE` | `dji_add()`: that feedback identifier is taken on this bus |
 | `-ENOENT` | a frame not for this bus; an HT-03 ID never configured |
 | `-ENOSPC` | `ht03_cfg()`: every slot is taken |
+| `-EBUSY` | `dshot_update()`: the last frame is still going out; `dshot_command()`: a command still running, or the motor not stopped |
 | `-ENOTCONN` | `dji_update()`, `ht03_update()`: a motor is offline; its frames were still sent |
 | other | `can_send()`'s, the LEDC's or the HAL's, passed through |
 
