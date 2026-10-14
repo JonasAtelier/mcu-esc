@@ -14,6 +14,10 @@
 #include "esc.h"
 #include "esc_priv.h"
 
+#ifdef ESC_HAVE_DSHOT
+#include "dshot/dshot_math.h"
+#endif
+
 /* 400 kHz when a caller says 0: fast mode. */
 #define DEFAULT_SCL_HZ		400000
 
@@ -399,5 +403,163 @@ void esc_pwm_stop(struct esc_pwm *pwm)
 {
 	ledc_stop(ESC_PWM_MODE, pwm->channel, 0);
 }
+
+#ifdef ESC_HAVE_DSHOT
+/* ------------------------------------------------------------- DShot -- */
+
+/* The bit and high ticks at DSHOT_RMT_HZ are worked out in esc_priv.h. */
+int esc_dshot_attach(struct dshot_port *port,
+		     const struct dshot_config *config)
+{
+	int ret = 0;
+	uint8_t i;
+
+	for (i = 0; i < config->count; i++)
+		if (config->gpio[i] < 0)
+			return -EINVAL;
+#if !SOC_RMT_SUPPORT_TX_SYNCHRO
+	/* Without a sync manager the frames would start one after another. */
+	if (config->count > 1)
+		return -EOPNOTSUPP;
+#endif
+	port->bit_ticks = dshot_bit_ticks(DSHOT_RMT_HZ, config->speed);
+
+	for (i = 0; i < config->count; i++) {
+		rmt_tx_channel_config_t channel_cfg = {
+			.gpio_num = config->gpio[i],
+			.clk_src = RMT_CLK_SRC_DEFAULT,
+			.resolution_hz = DSHOT_RMT_HZ,
+			.mem_block_symbols = SOC_RMT_MEM_WORDS_PER_CHANNEL,
+			.trans_queue_depth = 1,
+		};
+		/* Empty in IDF: no initialiser fits both it and -pedantic. */
+		rmt_copy_encoder_config_t encoder_cfg;
+
+		memset(&encoder_cfg, 0, sizeof(encoder_cfg));
+		ret = esc_errno(rmt_new_tx_channel(&channel_cfg,
+						   &port->channel[i]));
+		if (ret)
+			break;
+		ret = esc_errno(rmt_new_copy_encoder(&encoder_cfg,
+						     &port->encoder[i]));
+		if (ret) {
+			rmt_del_channel(port->channel[i]);
+			break;
+		}
+		ret = esc_errno(rmt_enable(port->channel[i]));
+		if (ret) {
+			rmt_del_encoder(port->encoder[i]);
+			rmt_del_channel(port->channel[i]);
+			break;
+		}
+	}
+#if SOC_RMT_SUPPORT_TX_SYNCHRO
+	if (!ret && config->count > 1) {
+		rmt_sync_manager_config_t sync_cfg = {
+			.tx_channel_array = port->channel,
+			.array_size = config->count,
+		};
+
+		ret = esc_errno(rmt_new_sync_manager(&sync_cfg, &port->sync));
+	}
+#endif
+	if (ret) {
+		/* Undo channels 0..i-1, all set up in full. */
+		while (i--) {
+			rmt_disable(port->channel[i]);
+			rmt_del_encoder(port->encoder[i]);
+			rmt_del_channel(port->channel[i]);
+		}
+		return ret;
+	}
+	port->count = config->count;
+	return 0;
+}
+
+int esc_dshot_busy(struct dshot_port *port)
+{
+	for (uint8_t i = 0; i < port->count; i++)
+		if (rmt_tx_wait_all_done(port->channel[i], 0) != ESP_OK)
+			return -EBUSY;
+	return 0;
+}
+
+/*
+ * A send that failed part-way: channels 0..sent-1 already hold a frame
+ * that, under the sync manager, waits for the rest forever -- and keeps
+ * them busy. Disabling a channel stops it and drops its transaction (IDF
+ * v5.5.5 rmt_tx.c, rmt_tx_disable()); enabling it again and resetting the
+ * sync manager leaves all of them as before the send.
+ */
+static void esc_dshot_cancel(struct dshot_port *port, uint8_t sent)
+{
+	for (uint8_t i = 0; i < sent; i++) {
+		rmt_disable(port->channel[i]);
+		rmt_enable(port->channel[i]);
+	}
+#if SOC_RMT_SUPPORT_TX_SYNCHRO
+	if (port->sync)
+		rmt_sync_reset(port->sync);
+#endif
+}
+
+/*
+ * Sixteen symbols a motor, high for a 1's or a 0's time, then low for the
+ * rest of the bit; the channel rests low after the last one (eot_level 0).
+ * The symbols stay in the port until the next send: the copy encoder may
+ * read them after rmt_transmit() has returned.
+ */
+int esc_dshot_send(struct dshot_port *port, const uint16_t *frames)
+{
+	const rmt_transmit_config_t transmit_cfg = { .loop_count = 0 };
+	uint32_t one = dshot_high_ticks(port->bit_ticks, true);
+	uint32_t zero = dshot_high_ticks(port->bit_ticks, false);
+	int ret;
+
+#if SOC_RMT_SUPPORT_TX_SYNCHRO
+	if (port->sync) {
+		ret = esc_errno(rmt_sync_reset(port->sync));
+		if (ret)
+			return ret;
+	}
+#endif
+	for (uint8_t i = 0; i < port->count; i++) {
+		for (int bit = 0; bit < DSHOT_FRAME_BITS; bit++) {
+			bool set = frames[i] & (0x8000u >> bit);
+			uint32_t high = set ? one : zero;
+			rmt_symbol_word_t *symbol = &port->symbols[i][bit];
+
+			symbol->level0 = 1;
+			symbol->duration0 = high;
+			symbol->level1 = 0;
+			symbol->duration1 = port->bit_ticks - high;
+		}
+		ret = esc_errno(rmt_transmit(port->channel[i], port->encoder[i],
+					     port->symbols[i],
+					     sizeof(port->symbols[i]),
+					     &transmit_cfg));
+		if (ret) {
+			esc_dshot_cancel(port, i);
+			return ret;
+		}
+	}
+	return 0;
+}
+
+void esc_dshot_detach(struct dshot_port *port)
+{
+#if SOC_RMT_SUPPORT_TX_SYNCHRO
+	if (port->sync)
+		rmt_del_sync_manager(port->sync);
+#endif
+	for (uint8_t i = 0; i < port->count; i++) {
+		rmt_disable(port->channel[i]);
+		rmt_del_encoder(port->encoder[i]);
+		rmt_del_channel(port->channel[i]);
+	}
+	port->sync = NULL;
+	port->count = 0;
+}
+#endif /* ESC_HAVE_DSHOT */
 
 #endif /* ESP_PLATFORM */

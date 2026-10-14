@@ -10,6 +10,10 @@
 #include "esc.h"
 #include "esc_priv.h"
 
+#ifdef ESC_HAVE_DSHOT
+#include "dshot/dshot_math.h"
+#endif
+
 /*
  * The core is always built; each model's driver only under its own option.
  * With the library on and no model picked, say so -- stm-forge compiles
@@ -375,5 +379,144 @@ void esc_pwm_stop(struct esc_pwm *pwm)
 	HAL_TIM_PWM_Stop(pwm->tim, pwm->channel);
 }
 #endif /* HAL_TIM_MODULE_ENABLED */
+
+#ifdef ESC_HAVE_DSHOT
+/* ------------------------------------------------------------- DShot -- */
+
+#define DSHOT_BURST_ROWS	(DSHOT_FRAME_BITS + 1)
+
+/* TIM_CHANNEL_1..4 as CCR1..4's place in a burst row, or -1. */
+static int esc_dshot_slot(uint32_t channel)
+{
+	switch (channel) {
+	case TIM_CHANNEL_1:
+		return 0;
+	case TIM_CHANNEL_2:
+		return 1;
+	case TIM_CHANNEL_3:
+		return 2;
+	case TIM_CHANNEL_4:
+		return 3;
+	default:
+		return -1;
+	}
+}
+
+/*
+ * The update DMA as the burst needs it: memory to the timer's DMAR, word
+ * by word, the memory side stepping, once through the buffer.
+ */
+static bool esc_dshot_dma_fits(const DMA_HandleTypeDef *dma)
+{
+	return dma && dma->Init.Direction == DMA_MEMORY_TO_PERIPH &&
+	       dma->Init.PeriphInc == DMA_PINC_DISABLE &&
+	       dma->Init.MemInc == DMA_MINC_ENABLE &&
+	       dma->Init.PeriphDataAlignment == DMA_PDATAALIGN_WORD &&
+	       dma->Init.MemDataAlignment == DMA_MDATAALIGN_WORD &&
+	       dma->Init.Mode == DMA_NORMAL;
+}
+
+int esc_dshot_attach(struct dshot_port *port,
+		     const struct dshot_config *config)
+{
+	TIM_HandleTypeDef *tim = config->tim;
+	uint8_t used = 0;
+	uint8_t i;
+	int ret = 0;
+
+	if (!tim || !config->tick_hz ||
+	    !esc_dshot_dma_fits(tim->hdma[TIM_DMA_ID_UPDATE]))
+		return -EINVAL;
+	for (i = 0; i < config->count; i++) {
+		int slot = esc_dshot_slot(config->channel[i]);
+
+		if (slot < 0 || (used & (1u << slot)))
+			return -EINVAL;
+		used |= (uint8_t)(1u << slot);
+		port->slot[i] = (uint8_t)slot;
+		port->channel[i] = config->channel[i];
+	}
+	/* One counter period is one bit, exactly as the app was told. */
+	port->bit_ticks = __HAL_TIM_GET_AUTORELOAD(tim) + 1u;
+	if (port->bit_ticks != dshot_bit_ticks(config->tick_hz, config->speed))
+		return -EINVAL;
+
+	for (i = 0; i < config->count; i++) {
+		__HAL_TIM_SET_COMPARE(tim, config->channel[i], 0);
+		ret = esc_hal_errno(HAL_TIM_PWM_Start(tim, config->channel[i]));
+		if (ret)
+			break;
+	}
+	if (ret) {
+		while (i--)
+			HAL_TIM_PWM_Stop(tim, config->channel[i]);
+		return ret;
+	}
+	port->tim = tim;
+	port->count = config->count;
+	return 0;
+}
+
+/*
+ * The DMA is busy until its transfer-complete interrupt, which is why the
+ * app's IRQ handler has to call HAL_DMA_IRQHandler().
+ */
+int esc_dshot_busy(struct dshot_port *port)
+{
+	if (HAL_DMA_GetState(port->tim->hdma[TIM_DMA_ID_UPDATE]) ==
+	    HAL_DMA_STATE_BUSY)
+		return -EBUSY;
+	return 0;
+}
+
+/*
+ * Row b holds bit b's high time for every motor's CCR, the last row zeros:
+ * dshot_init() zeroed the port, and nothing writes that row or an unused
+ * channel's place.
+ *
+ * The timer's DMA burst, RM0090 Rev 3 (docs/rm0090.pdf, gitignored):
+ *   - DCR.DBA is the first register as a word offset from CR1, DCR.DBL the
+ *     number of registers less one (14.4.19, p.414). CCR1-CCR4 sit at
+ *     0x34-0x40 (Table 72, p.417): DBA 0x34 / 4 = 13 = TIM_DMABASE_CCR1,
+ *     4 registers = DBL 3 = TIM_DMABURSTLENGTH_4TRANSFERS.
+ *   - Each update DMA request moves DBL + 1 words through DMAR into
+ *     CCR1-CCR4 (14.4.20, p.415), and the DMA's count is all of them: rows
+ *     times four, its example's "6" for two updates of three registers.
+ *   - The registers take half-word or word writes (14.4, p.390): the DMA
+ *     goes word to word.
+ *   - With OCxPE set, a compare written now becomes active at the next
+ *     update event (14.4.7, p.402): row b is put out in the period after
+ *     the update that moved it, the zeros after bit 15, so the line ends
+ *     low.
+ *
+ * The burst state of the last send is cleared first: the HAL leaves it busy
+ * after completion (stm32f4xx_hal_tim.c, TIM_DMAPeriodElapsedCplt()).
+ */
+int esc_dshot_send(struct dshot_port *port, const uint16_t *frames)
+{
+	uint32_t one = dshot_high_ticks(port->bit_ticks, true);
+	uint32_t zero = dshot_high_ticks(port->bit_ticks, false);
+
+	for (int bit = 0; bit < DSHOT_FRAME_BITS; bit++)
+		for (uint8_t i = 0; i < port->count; i++)
+			port->burst[bit * 4 + port->slot[i]] =
+				(frames[i] & (0x8000u >> bit)) ? one : zero;
+
+	HAL_TIM_DMABurst_WriteStop(port->tim, TIM_DMA_UPDATE);
+	return esc_hal_errno(HAL_TIM_DMABurst_MultiWriteStart(
+		port->tim, TIM_DMABASE_CCR1, TIM_DMA_UPDATE, port->burst,
+		TIM_DMABURSTLENGTH_4TRANSFERS, DSHOT_BURST_ROWS * 4));
+}
+
+void esc_dshot_detach(struct dshot_port *port)
+{
+	HAL_TIM_DMABurst_WriteStop(port->tim, TIM_DMA_UPDATE);
+	for (uint8_t i = 0; i < port->count; i++) {
+		__HAL_TIM_SET_COMPARE(port->tim, port->channel[i], 0);
+		HAL_TIM_PWM_Stop(port->tim, port->channel[i]);
+	}
+	port->count = 0;
+}
+#endif /* ESC_HAVE_DSHOT */
 
 #endif /* !ESP_PLATFORM */

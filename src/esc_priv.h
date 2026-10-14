@@ -92,6 +92,7 @@ struct esc_bus_ops {
 #ifdef ESP_PLATFORM
 #include "driver/i2c_master.h"
 #include "driver/ledc.h"
+#include "soc/soc_caps.h"	/* SOC_RMT_*: which chips have an RMT */
 #include "driver/spi_master.h"
 #include "driver/uart.h"
 #include "esp_err.h"
@@ -144,6 +145,10 @@ static inline int esc_errno(esp_err_t err)
 #else /* STM32 HAL */
 #include CMSIS_device_header
 
+#if (!defined(HAL_TIM_MODULE_ENABLED) || !defined(HAL_DMA_MODULE_ENABLED)) && \
+    CONFIG_ESC_DSHOT
+#error "the DShot driver needs the HAL TIM and DMA modules: #define HAL_TIM_MODULE_ENABLED and HAL_DMA_MODULE_ENABLED in the app's stm32<family>xx_hal_conf.h, with stm32<family>xx_hal_tim.c and _dma.c in the build"
+#endif
 #if !defined(HAL_TIM_MODULE_ENABLED) && CONFIG_ESC_C615
 #error "the C615 driver needs the HAL TIM module: #define HAL_TIM_MODULE_ENABLED in the app's stm32<family>xx_hal_conf.h, with stm32<family>xx_hal_tim.c in the build"
 #endif
@@ -314,6 +319,56 @@ int esc_pwm_attach(struct esc_pwm *pwm, int gpio, ledc_timer_t timer,
 int esc_pwm_attach(struct esc_pwm *pwm, TIM_HandleTypeDef *tim,
 		   uint32_t channel, uint32_t tick_hz);
 #endif
+#endif
+
+/*
+ * The DShot port: up to four outputs that each send one 16-bit frame per
+ * esc_dshot_send(), together. Outside the bus layer too.
+ *
+ *   ESP-IDF: one RMT TX channel per motor at DSHOT_RMT_HZ, a copy encoder
+ *            each, and for more than one motor a sync manager, so all start
+ *            at once. Only on a chip with an RMT (SOC_RMT_SUPPORTED: not
+ *            the C2), and more than one motor only where the RMT can start
+ *            channels together (SOC_RMT_SUPPORT_TX_SYNCHRO: not the
+ *            original ESP32). The line rests low.
+ *   HAL:     the app's timer, one bit per counter period; its update DMA
+ *            burst-writes CCR1-CCR4 (DCR base CCR1, 4 transfers) from a
+ *            buffer of 16 rows of four compares and one row of zeros, so
+ *            the line ends low. One stream for every motor.
+ *
+ * esc_dshot_attach() checks and sets up, lines low; esc_dshot_busy() is
+ * -EBUSY while the last frame is still going out; esc_dshot_send() puts
+ * frames[0..count-1] out; esc_dshot_detach() stops and releases.
+ */
+#if (defined(ESP_PLATFORM) && SOC_RMT_SUPPORTED) || \
+    (!defined(ESP_PLATFORM) && defined(HAL_TIM_MODULE_ENABLED) && \
+     defined(HAL_DMA_MODULE_ENABLED))
+#define ESC_HAVE_DSHOT
+#include "dshot.h"		/* struct dshot_port, placed in struct dshot_bus */
+
+/*
+ * RMT resolution, 125 ns ticks: 8 MHz divides every chip's default RMT
+ * clock (RMT_CLK_SRC_DEFAULT, soc/<chip>/include/soc/clk_tree_defs.h in IDF
+ * v5.5.5): the 80 MHz APB of the ESP32, S2, S3 and C3, the 80 MHz PLL of
+ * the C5, C6 and P4, the H2's 32 MHz crystal -- so every channel gets
+ * exactly this. The bit and its highs, against [BW]'s table
+ * (docs/chips.md, "DShot"):
+ *
+ *   DShot150: 53 ticks = 6.625 us (6.67, -0.7 %); 1 high 40 = 5.000 us,
+ *             0 high 20 = 2.500 us -- both exact
+ *   DShot300: 27 ticks = 3.375 us (3.33, +1.3 %); 20 = 2.500, 10 = 1.250
+ *   DShot600: 13 ticks = 1.625 us (1.67, -2.5 %); 10 = 1.250, 5 = 0.625
+ *
+ * The highs, which tell a 1 from a 0, come out exact; only the bit period
+ * is off by the rounding above. No source gives a tolerance for it.
+ */
+#define DSHOT_RMT_HZ	8000000u
+
+int esc_dshot_attach(struct dshot_port *port,
+		     const struct dshot_config *config);
+int esc_dshot_busy(struct dshot_port *port);
+int esc_dshot_send(struct dshot_port *port, const uint16_t *frames);
+void esc_dshot_detach(struct dshot_port *port);
 #endif
 
 #ifdef ESC_HAVE_PWM
