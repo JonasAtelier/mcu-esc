@@ -41,7 +41,7 @@ forge package key are `esc`.
 | **DJI GM6020** | built in | CAN, 1 Mbit/s | current +-3 A, or voltage in raw counts | angle, position, velocity |
 | **DJI C615** | Snail 2305 and others | PWM, 400-2200 us, up to 500 Hz | throttle 0..1 | none |
 | **Haitai HT-03** | HT8108-J6, built in | CAN, 1 Mbit/s, MIT protocol | torque; the full MIT command | position, velocity, torque |
-| **DShot ESCs** | any | DShot150/300/600, up to 4: RMT on the ESP32-S2, S3, C3, C5, C6, H2, P4 (one motor on the ESP32, none on the C2); STM32 timer + DMA | throttle 0..1, raw value, special commands | none yet (bidirectional: phase 2) |
+| **DShot ESCs** | any | DShot150/300/600, up to 4: RMT on the ESP32-S2, S3, C3, C5, C6, H2, P4 (one motor on the ESP32, none on the C2); STM32 timer + DMA | throttle 0..1, raw value, special commands | bidirectional (300 and up): eRPM, RPM, velocity; with EDT temperature, voltage, current, debug, status -- ESP32 RMT (2 motors on the S2, C3, C5, C6, H2), STM32F4 |
 
 One Kconfig option per model: `ESC_C610`, `ESC_C620`, `ESC_GM6020`,
 `ESC_C615`, `ESC_HT03`, `ESC_DSHOT`. Every number is cited to its manual in the
@@ -132,6 +132,7 @@ if (esc_get_feedback(wheel, &fb) == 0 && fb.online)
 | HT-03 | [ht03](examples/esp/ht03/), esp-HT03's position hold | -- |
 | C615 | [c615](examples/esp/c615/), a throttle ramp on LEDC | [c615](examples/stm/c615/main.c), four on TIM8 as on Hawk |
 | DShot | [dshot](examples/esp/dshot/), four on an S3's RMT: arm, beep, ramp | [dshot](examples/stm/dshot/main.c), four on TIM8 and one DMA stream |
+| DShot, bidirectional | [dshot_bidir](examples/esp/dshot_bidir/), two with EDT: RPM and temperature | [dshot_bidir](examples/stm/dshot_bidir/main.c), four on TIM8, sampling GPIOC |
 
 ESP-IDF examples find this library and mcu-can through
 `EXTRA_COMPONENT_DIRS`, which assumes they are checked out side by side as
@@ -157,11 +158,10 @@ STM32 examples are snippets to integrate into your application.
   calibrated the ESC to; the manual does not say which pulse stops it.
 - **HT-03 checked against the STM32F446 rewrite** of the MIT firmware; the
   HT-03 ships the older mbed one. See the [model reference](docs/chips.md#haitai-ht-03).
-- **DShot is output only for now.** Bidirectional DShot (eRPM back on the
-  signal wire) is designed in -- the inverted CRC and the reply's decoding
-  are there and tested -- but capturing the reply is a later phase;
-  `bidirectional` is `-EOPNOTSUPP`. The telemetry bit only asks: the reply on
-  the ESC's separate telemetry wire is not read.
+- **Bidirectional DShot is host-tested, not yet run against an ESC.** The
+  reply is read on ESP-IDF's RMT and on the STM32F4 only (other STM32
+  families: `-EOPNOTSUPP`), one update late. The telemetry bit only asks:
+  the reply on the ESC's separate telemetry wire is not read.
 - **No locks.** One task per bus, or your own mutex.
 
 ## Documentation

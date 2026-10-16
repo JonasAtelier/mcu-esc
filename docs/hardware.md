@@ -91,7 +91,9 @@ and channel per ESC; ESCs at one rate may share the timer.
 
 Each ESC's signal wire to one output, grounds common. The line rests low;
 every frame is 16 pulses of 3/4 or 3/8 of the bit ([model
-reference](chips.md#dshot)).
+reference](chips.md#dshot)). Bidirectional, the line rests high, every
+pulse is low, and the ESC answers on the same wire; nothing may pull the
+line down while it rests.
 
 **ESP-IDF (the S3 is the target).** One RMT TX channel per motor, any
 output-capable GPIO. The S3 has four TX channels with 48 symbols each and can
@@ -127,7 +129,7 @@ could use:
 | Request | DMA2 stream / channel | Needed by |
 |---|---|---|
 | TIM8_UP | 1 / 7 | DShot, now |
-| TIM8_CH1 | 2 / 7, or 2 / 0 | bidirectional capture, phase 2 |
+| TIM8_CH1 | 2 / 7, or 2 / 0 | nothing: bidirectional DShot samples through TIM8_UP |
 | TIM8_CH2 | 3 / 7, or 2 / 0 | the same |
 | TIM8_CH3 | 4 / 7, or 2 / 0 | the same |
 | TIM8_CH4 | 7 / 7 (shared with TIM8_TRIG, TIM8_COM) | the same |
@@ -136,12 +138,8 @@ could use:
 
 A stream serves one channel at a time (9.3.3, p.216). Hawk's firmware uses
 no DMA today -- SPI1 is polled (`project/hawk/src`, no DMA call) -- so
-nothing competes with stream 1 now. **No collision with SPI1, now or in
-phase 2, provided SPI1 takes stream 0 for RX and stream 5 for TX**: TIM8's
-update and its four captures need streams 1, 2, 3, 4 and 7, and SPI1's
-other choices, 2 and 3, are exactly the CH1 and CH2 captures'. Stream 2
-channel 0 can carry CH1, CH2 or CH3, but only one at a time, so it does not
-replace three streams.
+nothing competes with stream 1 now. **No collision with SPI1**: DShot, plain or
+bidirectional, takes stream 1 only, and SPI1 can have any of its streams.
 
 **Hawk cannot run DShot as built.** Its four ESCs are DJI C615s, which take
 PWM only: the C615 guide lists 400-2200 us and at most 500 Hz and never
@@ -153,19 +151,32 @@ the ESC drives the reply ([BW] "Bidirectional DSHOT"); the 10 k pull-downs
 on PC6-PC9 pull the other way while nobody drives it. They have to become
 pull-ups, or go, before bidirectional DShot can work there.
 
-### What bidirectional DShot (phase 2) will cost
+### Bidirectional DShot
 
-- **ESP32-S3:** one RMT RX channel per motor on the same GPIO as its TX
-  (`io_loop_back` with `io_od_mode`, `invert_out`/`invert_in`;
-  `driver/rmt_tx.h:43-46`, `driver/rmt_rx.h:42-44`) -- all four of the
-  S3's RX channels for four motors. Per frame and motor: arm a receive before
-  sending, then two interrupts (TX done, RX done), and a few microseconds to
-  decode 21 bits.
-- **STM32F4:** after each frame every channel turns from output to input
-  capture inside the reply window and back, and each captures its edges
-  through its own DMA request (TIM8_CH1-4) on top of the update stream:
-  five of DMA2's eight streams for four motors, CCMR/CCER rewritten twice a
-  frame -- or one motor read per frame in turn, at a quarter of the eRPM
-  rate. On TIM8 those requests are DMA2 streams 2, 3, 4 and 7, channel 7,
-  besides the update's stream 1 (table above): five of DMA2's eight, none
-  shared.
+- **ESP-IDF:** an RMT RX channel per motor on the motor's own GPIO, besides
+  its TX channel -- all four of the S3's RX channels for four motors, both
+  of the C3's for two ([model reference](chips.md#bidirectional-dshot)).
+  The pin is push-pull while a frame goes out and open-drain while the ESC
+  answers; the RX channel's internal pull-up holds the line high in
+  between, and the ESC drives its reply. Per frame and motor: a receive
+  armed before sending, two interrupts (TX done, RX done), and the decoding
+  in the next `dshot_update()`. The TX-done interrupt must come within the
+  30 us before the reply, and a flash write holds off a non-cache-safe
+  interrupt for longer: set `CONFIG_RMT_TX_ISR_CACHE_SAFE` and
+  `CONFIG_RMT_RX_ISR_CACHE_SAFE` (IDF v5.5.5 `esp_driver_rmt/Kconfig`; the
+  library's callbacks are in IRAM and touch only the bus, which must then
+  be in internal RAM), as `examples/esp/dshot_bidir` does.
+- **STM32F4:** TIM1 or TIM8, whose update DMA is on DMA2 -- DMA1, which
+  TIM2-5 use, cannot reach the GPIO (RM0090 2.1.5, p.52), so their bus is
+  `-EOPNOTSUPP`. Every motor's pin on one GPIO port -- PC6-PC9 on Hawk --
+  in alternate-function mode; the library sets their pull-ups and the
+  channels' polarity. Per frame: two DMA interrupts, in which the pins
+  turn to inputs and back and the stream turns round. The first must run
+  within about 15 us of the frame's end, half the 30 us before the reply:
+  give the stream's IRQ (DMA2_Stream1 on Hawk) a high priority, above
+  anything that runs long. Nothing else may use
+  the update DMA handle or write the port's MODER from an interrupt that
+  can preempt the DMA's.
+- **Either:** a frame and its reply take up to about 130 us at DShot600
+  and 185 at DShot300, so the loop runs no faster than that. Not yet run
+  against an ESC.

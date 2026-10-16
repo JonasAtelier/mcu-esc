@@ -137,9 +137,9 @@ them in the repository; read on 2026-10-14:
 | BW | Chris Landa, "DSHOT - the missing Handbook", 2021-02-27 | https://brushlesswhoop.com/dshot-and-bidirectional-dshot/ |
 | BLH | BLHeli_32 `Digital_Cmd_Spec.txt` | https://raw.githubusercontent.com/bitdump/BLHeli/master/BLHeli_32%20ARM/BLHeli_32%20Firmware%20specs/Digital_Cmd_Spec.txt |
 | EDT | Extended DShot Telemetry specification, README | github.com/bird-sanctuary/extended-dshot-telemetry @ `438b87983b58369e3e46068b0b975634f4ea5416` |
-| BF | Betaflight `src/main/drivers/dshot.c` -- GPL, read for facts only, nothing copied | github.com/betaflight/betaflight @ `4b7fa8e40a562a20b328fc50bd8829d6bded08eb` |
+| BF | Betaflight `src/main/drivers/dshot.c` and `dshot_bitbang_decode.c` -- GPL, read for facts only, nothing copied | github.com/betaflight/betaflight @ `4b7fa8e40a562a20b328fc50bd8829d6bded08eb` |
 | IDF | ESP-IDF v5.5.5 `examples/peripherals/rmt/dshot_esc` (Apache-2.0), a cross-check | `~/esp-idf` |
-| RM0090 | ST RM0090 Rev 3, STM32F40x/41x/42x/43x reference manual (Doc ID 018909): the timer DMA burst, the DMA2 request mapping | `docs/rm0090.pdf` (gitignored) |
+| RM0090 | ST RM0090 Rev 3, STM32F40x/41x/42x/43x reference manual (Doc ID 018909): the timer DMA burst, the DMA2 request mapping and bus, the GPIO registers | `docs/rm0090.pdf` (gitignored) |
 | Bluejay | github.com/bird-sanctuary/bluejay @ `0368d114b72f3939ea49c671b199bf0d13d9079d`: only that it supports DShot 300 and 600 and bidirectional DShot (README) | |
 
 The constants are in `src/dshot/dshot_proto.h`, the arithmetic in
@@ -228,23 +228,96 @@ commands" (line 31); that is the app's to add. Betaflight sends 10 repeats
 rather than 6, 1 ms apart [BF `dshot_command.c:39, 191-205`]; mcu-esc sends the
 6 the specification asks for, one per `dshot_update()`.
 
-### Bidirectional DShot: designed in, phase 2
-
-What is decoded already, in `dshot_math.h`, host-tested:
+### Bidirectional DShot
 
 | What | Value | Source |
 |---|---|---|
-| Line | inverted: idle high; the ESC answers on the same wire, about 30 us after each frame | BW "Bidirectional DSHOT" |
-| Rates | DShot300 and up only | BW |
-| Reply | 21 bits at 5/4 of the bit rate: a 0, then 20 GCR bits sent as changes of level (a 1 toggles) | BW "eRPM Transmission" |
+| Line | inverted: idle high, every bit starts low; the frame's CRC inverted | BW "Bidirectional DSHOT" |
+| Rates | DShot300 and up only; below is `-EINVAL` | BW |
+| Reply | 21 bits at 5/4 of the bit rate (375 / 750 kbit/s), not inverted: a 0, so the line falls, then 20 GCR bits sent as changes of level (a 1 toggles) | BW "eRPM Transmission" |
+| When | 30 us after the frame, whatever the speed | EDT "Timing"; BW "Bidirectional DSHOT" |
 | GCR | nibble 0-F to 19 1B 12 13 1D 15 16 17 1A 09 0A 0B 1E 0D 0E 0F; decode `gcr = raw ^ (raw >> 1)` | BW "eRPM Transmission", "Decoding" |
+| Longest level | 3 bits: no quintet has more than two 0s in a row, none starts or ends with more than one | the table above; `test_dshot_math` checks all 65536 frames |
 | Frame | `eeemmmmmmmmmcccc`: period in us = m << e; CRC the plain one | BW "eRPM Telemetry Frame"; EDT "Checksum"; BF `dshot.c:214` |
 | Stopped | data `0x0FFF` | BF `dshot.c:209-211` |
 | eRPM | 60 000 000 / period, rounded (one electrical turn per period) | arithmetic |
-| EDT | with EDT on, a prefix (bits 11-8) other than 0 and bit 8 clear is an EDT frame: type in bits 11-9 (001 temperature in deg C, 010 voltage in 0.25 V, 011 current in A, ...), value in 7-0 | EDT "eRPM Frames", "EDT Frames" |
+| RPM | eRPM / (poles / 2), rounded | BF `dshot.c:393-395` |
+| Sampling | Betaflight's bit-banged decoder reads the line at 3 samples a bit; mcu-esc's STM32 port does the same | BF `dshot_bitbang_decode.c:181-183` |
 
-What phase 2 adds is the capture and the line turnaround -- see
-[hardware.md](hardware.md#dshot) for what it costs on each platform.
-`dshot_config.bidirectional` is `-EOPNOTSUPP` until then, and
-`esc_get_feedback()` too; it will become `ESC_HAS_VELOCITY` from eRPM over
-the motor's pole pairs.
+**Extended DShot Telemetry.** Once command 13 has gone out six times, an
+EDT firmware answers with a version frame and from then on sends, now and
+then instead of eRPM, frames whose prefix (bits 11-8) is not 0 and has bit 8
+clear: type in bits 11-9, value in 7-0 [EDT "eRPM Frames", "EDT Frames",
+"Enabling EDT"]. eRPM frames are normalised so they never look like that;
+before command 13 every reply is eRPM, which mcu-esc keeps to.
+
+| Type | Bits 11-8 | Value | Source |
+|---|---|---|---|
+| Temperature | 001 0 | deg C, 0-255 | EDT "EDT Frames" |
+| Voltage | 010 0 | 0.25 V a step, 0-63.75 V | EDT |
+| Current | 011 0 | A, 0-255 | EDT |
+| Debug 1, 2 | 100 0, 101 0 | the firmware's own | EDT |
+| Stress level | 110 0 | 0-255 (since EDT v2.0.0; [BW] still calls it debug 3) | EDT; BW "Extended DShot Telemetry (EDT)" |
+| Status | 111 0 | bit 7 alert, 6 warning, 5 error, 3-0 highest stress (since v2.0.0) | EDT |
+| Version | 111 0 | the status-type frame right after command 13 | EDT "Enabling EDT" |
+| Off | `0xEFF` | the answer to command 14; mcu-esc reads eRPM again after it | EDT "Disabling EDT" |
+
+**What mcu-esc picks, and why.**
+
+- **When a reply is read.** The answer to a frame is read by the next
+  `dshot_update()`, before it sends: one update of latency, no interrupt
+  work in the library beyond turning the line round.
+- **How long it listens.** 45 us after the frame for the reply to start --
+  [EDT]'s 30 us and half again (`DSHOT_REPLY_WAIT_US`), a margin no source
+  gives -- then 22 reply bits. A reply that starts later is lost.
+- **ESP-IDF.** The TX channel's output is inverted (`invert_out`), so the
+  frame's symbols are plain DShot's and the line rests high. An RMT RX channel
+  on the same GPIO, as IDF's own 1-wire bus does it (IDF v5.5.5
+  `docs/en/api-reference/peripherals/rmt.rst:628`), is armed before each
+  frame and hears the frame, the rest, the reply, and stops once the line
+  has rested `DSHOT_REPLY_WAIT_US` (`signal_range_max_ns`); pulses under
+  200 ns are glitches (`signal_range_min_ns`; the shortest real one is
+  375 ns). The reply is what follows the first level longer than any a
+  reply holds. While the frame goes out the pin is push-pull; the TX-done
+  interrupt turns it open-drain (`gpio_ll_od_enable()`, inline, so the
+  callback needs no flash) and the next send turns it back, so the ESC can
+  drive the reply against nothing but the RX channel's pull-up. A flash
+  write would hold that interrupt off past the reply unless the RMT's ISRs
+  are cache-safe (`CONFIG_RMT_TX_ISR_CACHE_SAFE`,
+  `CONFIG_RMT_RX_ISR_CACHE_SAFE`).
+- **Which ESP chips.** Every chip with an RMT: the RX channel is a second
+  channel per motor. The S3 and P4 have four RX channels of their own; the
+  C3, C5, C6 and H2 two; the ESP32 and S2 have channels that each do
+  either, eight and four (`SOC_RMT_RX_CANDIDATES_PER_GROUP`,
+  `SOC_RMT_CHANNELS_PER_GROUP`, `soc/<chip>/include/soc/soc_caps.h`, IDF
+  v5.5.5). So four motors on the S3 and P4, two on the S2, C3, C5, C6 and
+  H2, one on the ESP32 (no TX sync); more is `-EOPNOTSUPP`.
+- **STM32.** The same timer and the same update DMA stream: no capture
+  channels, no second stream. The burst gets a second row of zeros, so its
+  transfer-complete interrupt comes with the line already at rest. That
+  interrupt turns the motors' pins to inputs (pull-ups set at init), sets
+  the timer to a third of a reply bit -- 75 ticks at 168 MHz for DShot600,
+  149 for DShot300 -- and points the stream at the port's input register,
+  half-word by half-word, for 45 us and 22 reply bits: 167 and 117 samples.
+  The next interrupt puts everything back. One port read samples all four
+  motors at once, which is why their pins must share a port. It needs
+  DMA2, whose peripheral port reaches the AHB1 GPIO through the bus matrix
+  (RM0090 2.1.5, p.52; Figure 25 note 1, p.214) -- TIM8_UP is DMA2 stream
+  1, TIM1_UP DMA2 stream 5 (Table 34, p.217); TIM2-5's update requests
+  are on DMA1 (Table 33, p.216), whose streams sit below DMA2's (0x4002
+  6000 against 0x4002 6400, Table 2, p.53), so an update DMA below
+  `DMA2_Stream0` is `-EOPNOTSUPP` -- and it is built for the STM32F4 only,
+  the family RM0090 covers; elsewhere `bidirectional` is `-EOPNOTSUPP`.
+  Only a transfer error stops the stream (`HAL_DMA_IRQHandler()`): then
+  the compares go 0 and the line rests; FIFO and direct-mode errors are
+  left alone.
+
+| RM0090 register | What the STM32 port writes | Where |
+|---|---|---|
+| TIMx_CCER CCxP | 1: output active low, so compare 0 holds the line high | 14.4.9, p.405; PWM mode 1, 14.4.7, p.402 |
+| TIMx_EGR UG | reload ARR and the counter at once when the period changes | 14.4.6, p.399 |
+| TIMx_DIER UDE | update DMA off while switching, on to run | 14.4.4, p.396 |
+| TIMx_DCR | CCR1, 4 transfers, as the HAL's burst sets it | 14.4.19, p.414 |
+| GPIOx_MODER | 00 input between frames, 10 alternate function for them | 7.4.1, p.198 |
+| GPIOx_PUPDR | 01 pull-up, at init; left so at del | 7.4.4, p.200 |
+| GPIOx_IDR | read by the DMA as a half-word, which GPIO registers allow | 7.4, p.198; 7.4.5, p.200 |

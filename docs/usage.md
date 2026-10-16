@@ -15,7 +15,7 @@ Each model hands out one `struct esc_dev *` per motor:
 | Call | Does |
 |---|---|
 | `esc_set_command(esc, kind, value)` | stores a command, clamped to the model's range; `-EOPNOTSUPP` for a kind the model does not take, `-EINVAL` for a value that is not finite |
-| `esc_get_feedback(esc, &fb)` | the last feedback, decoded; `-EOPNOTSUPP` on the C615 |
+| `esc_get_feedback(esc, &fb)` | the last feedback, decoded; `-EOPNOTSUPP` on the C615 and on DShot that is not bidirectional |
 | `esc_log_feedback(esc, &fb)` | one info line of the fields it has |
 
 | Kind | Unit | Taken by |
@@ -156,13 +156,16 @@ dshot_update(&bus, dt_s);                   /* one frame to every motor */
 
 | Call | Does |
 |---|---|
-| `dshot_init(&bus, &cfg)` | checks the config and sets the outputs up; `-EOPNOTSUPP` for `bidirectional` |
+| `dshot_init(&bus, &cfg)` | checks the config and sets the outputs up; bidirectional below DShot300 is `-EINVAL`, where the platform cannot read the reply `-EOPNOTSUPP` |
 | `dshot_esc(&bus, i)` | motor i's `esc_dev`; NULL past `count` |
 | `dshot_update(&bus, dt_s)` | one frame to every motor, together; `dt_s` counts down a command's wait. `-EBUSY`, sending nothing, while the last frame is still on the wire |
 | `dshot_command(esc, cmd)` | a special command: its frames with the telemetry bit, then value 0 for its wait ([model reference](chips.md#special-commands)); `-EBUSY` while one is still going, or for 0-36 while the motor runs |
 | `dshot_set_value(esc, v, telemetry)` | the raw value, 0 or 48-2047 -- 3D mode's halves, say; the bit stays on until the next throttle. 1-47 are `-EINVAL`: commands go through `dshot_command()` |
 | `dshot_request_telemetry(esc)` | the bit in the next frame only |
 | `dshot_del(&bus)` | outputs stopped, lines low |
+| `dshot_get_erpm(esc, &erpm)` | bidirectional: the last eRPM; `-ENODATA` until one came |
+| `dshot_get_rpm(esc, poles, &rpm)` | the same over the pole pairs, rounded |
+| `dshot_get_telemetry(esc, &t)` | everything the ESC said, the latest of each, `t.has` saying which; replies and errors counted |
 
 Throttle 0 is value 0, motor stop; any throttle above 0 is 48..2047,
 linear, rounded. The library sends nothing between two updates: call
@@ -174,16 +177,55 @@ timer and its update DMA set up as `dshot.h` describes, the DMA's IRQ
 calling `HAL_DMA_IRQHandler()` -- the library sees a frame finished only
 through the HAL's DMA state.
 
+### Bidirectional
+
+```c
+struct dshot_config cfg = {
+    .speed = DSHOT_600, .count = 2, .bidirectional = true,
+    .poles = 14,                            /* for esc_get_feedback()'s velocity */
+    .gpio = { 4, 5 },                       /* STM32F4: also .gpio = GPIOC, .pin */
+};
+
+dshot_init(&bus, &cfg);                     /* lines high */
+dshot_command(dshot_esc(&bus, 0), DSHOT_CMD_EXTENDED_TELEMETRY_ENABLE);
+/* every period, as before; then */
+dshot_get_rpm(dshot_esc(&bus, 0), 14, &rpm);
+dshot_get_telemetry(dshot_esc(&bus, 0), &t);    /* t.temperature_c, ... */
+esc_get_feedback(dshot_esc(&bus, 0), &fb);      /* velocity, temperature */
+```
+
+The line is inverted and the ESC answers every frame on it, 30 us later.
+`dshot_update()` reads that answer before it sends the next frame, so every
+value is one update old; a missing or garbled answer adds to `t.errors` and
+keeps the last value. The ESC sends eRPM unless Extended DShot Telemetry is
+on -- command 13, which the firmware must support -- and then now and then
+a temperature, voltage, current, debug, stress or status frame instead
+([model reference](chips.md#bidirectional-dshot)). `esc_get_feedback()`
+gives `ESC_HAS_VELOCITY` (with `poles`) and `ESC_HAS_TEMPERATURE` once
+they have arrived, `online` while good replies came within
+`DSHOT_REPLY_TIMEOUT_S` (0.1 s of `dt_s`).
+
+Each frame now takes the frame, 30 us, the reply and a wait for the line
+to rest -- up to about 130 us at DShot600, 185 at DShot300 -- and `dshot_update()`
+is `-EBUSY` until it is over. ESP-IDF: an RX channel per motor besides its
+TX channel, so two motors on the S2, C3, C5, C6 and H2, four on the S3 and
+P4, one on the original ESP32; set `CONFIG_RMT_TX_ISR_CACHE_SAFE` and
+`CONFIG_RMT_RX_ISR_CACHE_SAFE`. STM32F4: TIM1 or TIM8 (update DMA on DMA2),
+every motor's pin on one GPIO port, in alternate-function mode, the update
+DMA's IRQ at high priority; the DMA handle belongs to the library while
+the bus lives. [Hardware](hardware.md#dshot) has the wiring.
+
 ## Errors
 
 | errno | Means |
 |---|---|
 | `-EINVAL` | a bad argument: NULL, an ID out of range, a value not finite, a bad config |
-| `-EOPNOTSUPP` | a command kind the model does not take, feedback from a C615 or DShot, a model built out, bidirectional DShot |
+| `-EOPNOTSUPP` | a command kind the model does not take, feedback from a C615 or from DShot that is not bidirectional, a model built out, bidirectional DShot where the platform cannot read the reply |
+| `-ENODATA` | `dshot_get_erpm()`, `dshot_get_rpm()`: no eRPM has arrived yet |
 | `-EADDRINUSE` | `dji_add()`: that feedback identifier is taken on this bus |
 | `-ENOENT` | a frame not for this bus; an HT-03 ID never configured |
 | `-ENOSPC` | `ht03_cfg()`: every slot is taken |
-| `-EBUSY` | `dshot_update()`: the last frame is still going out; `dshot_command()`: a command still running, or the motor not stopped |
+| `-EBUSY` | `dshot_update()`: the last frame is still going out, or its reply still due; `dshot_command()`: a command still running, or the motor not stopped |
 | `-ENOTCONN` | `dji_update()`, `ht03_update()`: a motor is offline; its frames were still sent |
 | other | `can_send()`'s, the LEDC's or the HAL's, passed through |
 

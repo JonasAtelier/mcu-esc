@@ -35,12 +35,14 @@ test/                       host tests, `make -C test test`
   c615_cases.h              C615 cases, shared by esp/ and stm/
   dshot_cases.h             DShot cases, shared by esp/ and stm/
   esp/                      suites on idf_stubs/, through esc_port_esp.c, a fake LEDC and RMT
-  stm/                      suites on hal_stubs/, through esc_port_stm.c, a fake TIM and DMA
+                            (test_dshot_nosync, test_dshot_c3: the ESP32's and C3's RMT)
+  stm/                      suites on hal_stubs/, through esc_port_stm.c, a fake TIM, DMA and GPIO
+                            (test_dshot_nof4: an STM32 other than the F4)
   idf_stubs/  hal_stubs/    the slice of ESP-IDF and of the HAL the code calls
   fixtures/                 verbatim copies of rm.h, hvd230can.h, upid.h for test_names
 examples/
-  esp/<name>/               ESP-IDF projects: dji, ht03, c615, dshot
-  stm/<name>/               STM32 snippets: dji_bxcan, c615, dshot
+  esp/<name>/               ESP-IDF projects: dji, ht03, c615, dshot, dshot_bidir
+  stm/<name>/               STM32 snippets: dji_bxcan, c615, dshot, dshot_bidir
 docs/                       the five guides; the manuals here are gitignored
 CMakeLists.txt              ESP-IDF only; stm-forge globs src/**/*.c instead
 Kconfig                     ESC and ESC_<MODEL>, for ESP-IDF and both forges' menus
@@ -108,7 +110,7 @@ the stopped channel's idle state. The struct lives in `c615.h`, its only
 user, so the app can place a `struct c615`.
 
 **The DShot port** is `struct dshot_port` and `esc_dshot_attach/busy/send/
-detach()`; `dshot.c` above it is the same C on both platforms and knows
+reply/detach()`; `dshot.c` above it is the same C on both platforms and knows
 frames, commands and waits, nothing of pulses. On ESP-IDF it is one RMT TX
 channel per motor at 8 MHz, a copy encoder each, and a sync manager over
 them for more than one motor, reset before every frame as IDF asks; if a
@@ -123,6 +125,22 @@ leaves its burst state busy after a transfer, so every send stops the last
 burst first, and the DMA handle's state, which the app's IRQ handler
 returns to ready, is the busy test. `struct dshot_port` lives in `dshot.h`
 so the app can place a `struct dshot_bus`.
+
+**Bidirectional**, the port also hands `dshot.c` each motor's reply to
+the last frame as 21 line bits (`esc_dshot_reply()`), and `dshot.c`
+decodes them with `dshot_math.h`: GCR, CRC, eRPM or EDT. Both ports turn
+what they saw into levels and lengths and build the bits with the same
+`dshot_reply_append()`. On ESP-IDF an RX channel per motor on the same GPIO
+hears the frame and the reply, and the TX-done callback turns the pin
+open-drain for the ESC; the RX-done callback stores the symbol count, and
+a count of -1 is the busy test. On the HAL (STM32F4 only) the frame goes
+out on the update DMA started directly -- the HAL's burst call would take
+the transfer-complete callback -- with two rows of zeros; that callback
+turns the pins to inputs and the same stream into a sampler of the port's
+IDR at three samples a reply bit, and the next one turns everything back.
+The callbacks find the port through the DMA handle's `Parent`, which the
+port borrows while the bus lives and gives back at del; the port's phase
+is the busy test.
 
 ## Bus abstraction
 
@@ -183,8 +201,8 @@ both ports' DShot halves, all 69 failing the suite.
 | `test_ht03` | esp-HT03's test_core.c on errno and `can_dev`: slots, special commands and their wait, set zero not sent when the exit fails, reply matching, DLC 6 and the F446 rewrite's 7 heard, 5 and 8 refused, offline and limp, a send error before offline; the `esc_dev`: torque only, the whole command replaced, feedback bits |
 | `esp/test_core`, `stm/test_core` | the kind, value and `commands` checks before the op; the op's error passed through; feedback zeroed for the op and untouched on failure; `-EOPNOTSUPP` without `get_feedback`; the log line |
 | `esp/test_c615`, `stm/test_c615` | refused endpoints, rates and a `max_us` that fills the period; nothing running after a failed init; throttle 0, 0.5, 1, clamped, rounded to the microsecond; the raw pulse inside the endpoints; del and after. ESP-IDF: the LEDC timer and channel settings, **the duty to the step at 400 and 50 Hz**, the stop level. HAL: **the rate from ARR**, the compare at 1, 84 and 1.5 MHz, the compare 0 before stop, refused handles and channels, a 32-bit ARR that wraps |
-| `test_dshot_math` | **[BW]'s worked frame 1046 both ways, `0x82C6` and `0x82C9`**; frames for 0, 48, 2047 and a command, with and without the bit; **bit and high ticks at 40 and 168 MHz against [BW]'s table**, rounding at 100 MHz; throttle 0, the bottom, half, the top, past it; **the reply: [BW]'s GCR example and its worst case, any leading level, quintets outside the table, a wrong or inverted CRC**; every table entry; the period m << e, [EDT]'s 512, 0x0FFF as stopped, period 0 refused, eRPM rounding; EDT against eRPM by prefix |
-| `esp/test_dshot`, `stm/test_dshot` | refused counts, speeds and bidirectional; **every motor's frame read back from its pulses**: throttle, raw values, the telemetry bit held and one-shot; **every command with a meaning: its frame count with the bit, the wait after it counted in dt_s, refused while running for 0-36 and taken for 42-47**, refused numbers, another model's `esc_dev`; **raw values 1-47 refused**; a busy line consuming nothing; **a failed send consuming no repeat, no wait, no one-shot bit**; del. ESP-IDF: **each channel at 8 MHz, 48 symbols, queue 1, every symbol one bit**, the sync manager over all channels and reset each frame, none for one motor, a pin below 0, **every setup call failing in turn leaving nothing allocated**, **a transmit failing on the third motor: the first two stopped and re-enabled, the sync reset, the next update going**; `esp/test_dshot_nosync`, the original ESP32's RMT: one motor works, more is `-EOPNOTSUPP`. HAL: **the burst into CCR1, 4 transfers, 68 words, stop before start**, the zero row, motors on channels out of order and an unused slot left 0, compares 0 at init and del, **every wrong DMA setting, channel and ARR refused**, ticks that do not divide, a channel that will not start stopping the others |
+| `test_dshot_math` | **[BW]'s worked frame 1046 both ways, `0x82C6` and `0x82C9`**; frames for 0, 48, 2047 and a command, with and without the bit; **bit and high ticks at 40 and 168 MHz against [BW]'s table**, rounding at 100 MHz; throttle 0, the bottom, half, the top, past it; **the reply: [BW]'s GCR example and its worst case, any leading level, quintets outside the table, a wrong or inverted CRC**; every table entry; the period m << e, [EDT]'s 512, 0x0FFF as stopped, period 0 refused, eRPM rounding; EDT against eRPM by prefix; **levels to reply bits at 8 and 168 MHz, a glitch, a low past bit 20, a long rest; all 65536 frames through levels and back, and their longest level 3 bits**; EDT types and values; RPM and rad/s from eRPM |
+| `esp/test_dshot`, `stm/test_dshot` | refused counts, speeds and bidirectional; **every motor's frame read back from its pulses**: throttle, raw values, the telemetry bit held and one-shot; **every command with a meaning: its frame count with the bit, the wait after it counted in dt_s, refused while running for 0-36 and taken for 42-47**, refused numbers, another model's `esc_dev`; **raw values 1-47 refused**; a busy line consuming nothing; **a failed send consuming no repeat, no wait, no one-shot bit**; del. ESP-IDF: **each channel at 8 MHz, 48 symbols, queue 1, every symbol one bit**, the sync manager over all channels and reset each frame, none for one motor, a pin below 0, **every setup call failing in turn leaving nothing allocated**, **a transmit failing on the third motor: the first two stopped and re-enabled, the sync reset, the next update going**; `esp/test_dshot_nosync`, the original ESP32's RMT: one motor works, more is `-EOPNOTSUPP`. HAL: **the burst into CCR1, 4 transfers, 68 words, stop before start**, the zero row, motors on channels out of order and an unused slot left 0, compares 0 at init and del, **every wrong DMA setting, channel and ARR refused**, ticks that do not divide, a channel that will not start stopping the others. **Bidirectional, both platforms: DShot150 and odd poles refused; the inverted CRC on every frame and command; eRPM read one update late, RPM and velocity from it, a silent or garbled motor counted and its last value kept, 0x0FFF stopped, offline after `DSHOT_REPLY_TIMEOUT_S`; EDT only after command 13, its version, every type, eRPM still eRPM, off after 0xEFF**; nothing back from a bus that is not bidirectional. ESP-IDF: **TX inverted, an RX channel on each GPIO at 8 MHz, receives armed with 200 ns and 45 us, the pin open-drain after each frame and push-pull before the next**, a busy receiver, replies at both speeds, **29 setup calls each failing in turn leaving nothing**, a receive or transmit failing part-way stopping every receiver; the ESP32 one motor, the C3 two. HAL: **CCxP and pull-ups set, 18 rows started on the DMA with DCR as the burst's, the pins inputs and ARR a third of a reply bit while 167 or 117 half-words come from the IDR, all back after**, motors on pins out of order, a sampling DMA that will not start or fails, **a FIFO or direct-mode error changing nothing and a transfer error mid-frame zeroing the compares**, a frame DMA that will not start, refused pins, **an update DMA on DMA1 refused**, del giving the handle back; another family `-EOPNOTSUPP` |
 | `esp/test_port_esp`, `stm/test_port_stm` | the bus layer, as in every category library |
 
 All build under `-std=gnu11 -Wall -Wextra -Werror -pedantic` with UBSan, and
@@ -200,3 +218,8 @@ model on and Hawk's HAL conf plus the CAN module, links each of
 `examples/stm/dji_bxcan` and `examples/stm/c615` against STM32CubeF4 HAL
 v1.8.5, with no warning from either library; `examples/stm/dshot` links
 the same way with DShot alone, with the C615, and with every model on.
+Bidirectional DShot: `examples/esp/dshot_bidir` builds for esp32s3 and
+esp32c3, and `examples/esp/dshot` still for esp32s3, on ESP-IDF v5.5.5
+with no warning; `examples/stm/dshot_bidir` and `examples/stm/dshot` link
+for an STM32F405 against STM32CubeF4 HAL with no warning from the library.
+Neither has been run against an ESC.
