@@ -1,0 +1,7 @@
+CONFIG_ESC_DSHOT=y
+# The RMT's ISRs run through flash writes too, so the line still turns
+# round in time for the reply (docs/hardware.md, "Bidirectional DShot")
+CONFIG_RMT_TX_ISR_CACHE_SAFE=y
+CONFIG_RMT_RX_ISR_CACHE_SAFE=y
+# 1 kHz tick, so vTaskDelay(pdMS_TO_TICKS(1)) is the 1 ms frame period
+CONFIG_FREERTOS_HZ=1000
