@@ -1,8 +1,8 @@
 /*
  * Pure DShot arithmetic, compiled and asserted on the host: the frame and
- * its CRC both ways, pulse widths, throttle, and the decoding of the
- * bidirectional reply (GCR, eRPM period, EDT) that phase 2's capture will
- * feed. Sources in dshot_proto.h.
+ * its CRC both ways, pulse widths, throttle, and the bidirectional reply --
+ * the line's levels to its 21 bits, GCR, eRPM, RPM and EDT. Sources in
+ * dshot_proto.h.
  */
 #ifndef DSHOT_MATH_H
 #define DSHOT_MATH_H
@@ -70,7 +70,7 @@ static inline uint16_t dshot_throttle_value(float throttle)
 	return (uint16_t)(DSHOT_THROTTLE_MIN + lroundf(throttle * span));
 }
 
-/* ---------------------------------------- the reply, for phase 2 -- */
+/* ------------------------------------------- the bidirectional reply -- */
 
 /*
  * One GCR quintet back to its nibble, or -1. The table is [BW "eRPM
@@ -145,7 +145,7 @@ static inline int dshot_reply_erpm(uint16_t data, uint32_t *erpm)
 {
 	uint32_t period = dshot_reply_period_us(data);
 
-	if (data == 0x0FFF) {
+	if (data == DSHOT_REPLY_STOPPED) {
 		*erpm = 0;
 		return 0;
 	}
@@ -153,6 +153,83 @@ static inline int dshot_reply_erpm(uint16_t data, uint32_t *erpm)
 		return -EBADMSG;
 	*erpm = (60000000u + period / 2) / period;
 	return 0;
+}
+
+/*
+ * A level the line held for ticks of a clock at clock_hz, in reply bits at
+ * 5/4 of kbit_s [BW "eRPM Transmission"], rounded: ticks * rate / clock.
+ */
+static inline uint32_t dshot_reply_run_bits(uint32_t ticks, uint32_t clock_hz,
+					    uint32_t kbit_s)
+{
+	uint64_t rate = (uint64_t)kbit_s * 1000u * DSHOT_REPLY_RATE_NUM;
+	uint64_t clock = (uint64_t)clock_hz * DSHOT_REPLY_RATE_DEN;
+
+	return (uint32_t)(((uint64_t)ticks * rate + clock / 2) / clock);
+}
+
+/*
+ * Collect the reply level by level, the first bit in bit 20: append count
+ * bits of one level to *raw, *bits holding how many it has. A run of 0
+ * bits is a glitch and a low past bit 20 no reply: -EBADMSG. A high past
+ * it is the line at rest after the last bit, and fills the rest.
+ */
+static inline int dshot_reply_append(uint32_t *raw, uint32_t *bits, bool high,
+				     uint32_t count)
+{
+	if (!count)
+		return -EBADMSG;
+	if (*bits + count > DSHOT_REPLY_BITS) {
+		if (!high)
+			return -EBADMSG;
+		count = DSHOT_REPLY_BITS - *bits;
+	}
+	if (!count)
+		return 0;
+	*raw = (*raw << count) | (high ? (1u << count) - 1 : 0);
+	*bits += count;
+	return 0;
+}
+
+/*
+ * The 21 bits once the levels have run out: the line rests high after the
+ * reply, so whatever is missing at the end is 1s.
+ */
+static inline uint32_t dshot_reply_finish(uint32_t raw, uint32_t bits)
+{
+	uint32_t missing = DSHOT_REPLY_BITS - bits;
+
+	return (raw << missing) | ((1u << missing) - 1);
+}
+
+/* The EDT frame's type, DSHOT_EDT_*, and its 8-bit value [EDT "EDT Frames"]. */
+static inline unsigned int dshot_edt_type(uint16_t data)
+{
+	return (data >> 9) & 0x7;
+}
+
+static inline uint8_t dshot_edt_value(uint16_t data)
+{
+	return (uint8_t)(data & 0xFF);
+}
+
+/*
+ * Mechanical turns per minute from electrical ones, rounded: eRPM over the
+ * pole pairs, poles / 2 [BF dshot.c:393-395]. poles is even and not 0.
+ */
+static inline uint32_t dshot_rpm(uint32_t erpm, uint32_t poles)
+{
+	uint32_t pairs = poles / 2;
+
+	return (erpm + pairs / 2) / pairs;
+}
+
+#define DSHOT_TWO_PI	6.28318530717958647692f
+
+/* The shaft's velocity, rad/s, from eRPM and poles as above. */
+static inline float dshot_erpm_to_rad_s(uint32_t erpm, uint32_t poles)
+{
+	return (float)erpm / (float)(poles / 2) * DSHOT_TWO_PI / 60.0f;
 }
 
 #endif /* DSHOT_MATH_H */

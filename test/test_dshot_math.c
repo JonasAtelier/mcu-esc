@@ -7,11 +7,13 @@
  *         examples.
  *   [EDT] extended-dshot-telemetry README @438b8798: the eRPM ranges and
  *         EDT prefixes.
- *   [BF]  Betaflight dshot.c @4b7fa8e4 lines 206-221 (facts only): 0x0FFF
- *         is stopped, the shifted value is a period in microseconds.
+ *   [BF]  Betaflight dshot.c @4b7fa8e4 lines 206-221 and 393-395 (facts
+ *         only): 0x0FFF is stopped, the shifted value is a period in
+ *         microseconds, RPM is eRPM over the pole pairs.
  */
 #include <assert.h>
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 
 #include "dshot_math.h"
@@ -180,12 +182,147 @@ static void test_reply(void)
 	assert(!dshot_reply_is_edt(0xF00));
 }
 
+/* The line's levels of a 21-bit reply, as runs: level and length. */
+static int runs_of(uint32_t line, bool high[], uint32_t count[])
+{
+	int runs = 0;
+
+	for (int bit = 20; bit >= 0; bit--) {
+		bool level = line & (1u << bit);
+
+		if (runs && high[runs - 1] == level) {
+			count[runs - 1]++;
+		} else {
+			high[runs] = level;
+			count[runs] = 1;
+			runs++;
+		}
+	}
+	return runs;
+}
+
+static void test_reply_line(void)
+{
+	uint32_t raw, bits;
+	uint16_t data;
+	int longest = 0;
+
+	/* 5/4 of the bit rate [BW]: 750 kbit/s at DShot600 is 10.67 ticks
+	 * of 8 MHz a bit, 375 kbit/s at DShot300 21.33 */
+	assert(dshot_reply_run_bits(11, 8000000u, 600) == 1);
+	assert(dshot_reply_run_bits(21, 8000000u, 600) == 2);
+	assert(dshot_reply_run_bits(32, 8000000u, 600) == 3);
+	assert(dshot_reply_run_bits(5, 8000000u, 600) == 0);	/* 0.47 */
+	assert(dshot_reply_run_bits(6, 8000000u, 600) == 1);	/* 0.56 */
+	assert(dshot_reply_run_bits(21, 8000000u, 300) == 1);
+	assert(dshot_reply_run_bits(64, 8000000u, 300) == 3);
+	/* 168 MHz: 224 ticks a reply bit at DShot600; 75-tick samples */
+	assert(dshot_reply_run_bits(3 * 75, 168000000u, 600) == 1);
+	assert(dshot_reply_run_bits(5 * 75, 168000000u, 600) == 2);
+	assert(dshot_reply_run_bits(240, 8000000u, 600) == 23);	/* 30 us */
+
+	/* [BW]'s example, level by level */
+	{
+		bool high[21];
+		uint32_t count[21];
+		int runs = runs_of(line_of(0xD4BD6), high, count);
+
+		raw = 0;
+		bits = 0;
+		for (int r = 0; r < runs; r++)
+			assert(dshot_reply_append(&raw, &bits, high[r],
+						  count[r]) == 0);
+		assert(bits == 21);
+		assert(dshot_reply_finish(raw, bits) == line_of(0xD4BD6));
+		/* the last level high and cut short: the rest is 1s */
+		raw = 0;
+		bits = 0;
+		for (int r = 0; r < runs - 1; r++)
+			dshot_reply_append(&raw, &bits, high[r], count[r]);
+		if (high[runs - 1])
+			assert(dshot_reply_finish(raw, bits) ==
+			       line_of(0xD4BD6));
+		/* a long high at the end is the line at rest */
+		raw = 0;
+		bits = 0;
+		for (int r = 0; r < runs - 1; r++)
+			dshot_reply_append(&raw, &bits, high[r], count[r]);
+		assert(dshot_reply_append(&raw, &bits, true, 40) == 0);
+		assert(bits == 21);
+	}
+	/* a low past bit 20 is no reply; a glitch of 0 bits neither */
+	raw = 0;
+	bits = 20;
+	assert(dshot_reply_append(&raw, &bits, false, 2) == -EBADMSG);
+	assert(dshot_reply_append(&raw, &bits, true, 0) == -EBADMSG);
+	assert(dshot_reply_append(&raw, &bits, true, 5) == 0 && bits == 21);
+	assert(dshot_reply_append(&raw, &bits, true, 5) == 0 && bits == 21);
+	assert(dshot_reply_finish(0, 0) == 0x1FFFFF);
+
+	/*
+	 * Every frame: no level held longer than DSHOT_REPLY_RUN_MAX inside
+	 * the reply, and line -> levels -> 21 bits -> data round trips.
+	 */
+	for (uint32_t frame = 0; frame < 0x10000; frame++) {
+		bool high[21];
+		uint32_t count[21];
+		uint32_t line = line_of(gcr_of((uint16_t)frame));
+		int runs = runs_of(line, high, count);
+
+		for (int r = 0; r < runs; r++)
+			if ((int)count[r] > longest &&
+			    !(r == runs - 1 && high[r]))
+				longest = (int)count[r];
+		raw = 0;
+		bits = 0;
+		for (int r = 0; r < runs; r++)
+			assert(dshot_reply_append(&raw, &bits, high[r],
+						  count[r]) == 0);
+		raw = dshot_reply_finish(raw, bits);
+		assert(raw == line);
+		if (dshot_crc((uint16_t)(frame >> 4), false) == (frame & 0xF)) {
+			assert(dshot_reply_decode(raw, &data) == 0);
+			assert(data == frame >> 4);
+		} else {
+			assert(dshot_reply_decode(raw, &data) == -EBADMSG);
+		}
+	}
+	assert(longest == DSHOT_REPLY_RUN_MAX);
+}
+
+static void test_edt_and_rpm(void)
+{
+	/* [EDT "EDT Frames"]: 001 0 is temperature, 111 0 status */
+	assert(dshot_edt_type(0x219) == DSHOT_EDT_TEMPERATURE);
+	assert(dshot_edt_value(0x219) == 25);
+	assert(dshot_edt_type(0x430) == DSHOT_EDT_VOLTAGE);
+	assert(dshot_edt_type(0x60A) == DSHOT_EDT_CURRENT);
+	assert(dshot_edt_type(0x8FF) == DSHOT_EDT_DEBUG1);
+	assert(dshot_edt_type(0xA01) == DSHOT_EDT_DEBUG2);
+	assert(dshot_edt_type(0xC80) == DSHOT_EDT_STRESS);
+	assert(dshot_edt_type(0xEA3) == DSHOT_EDT_STATUS);
+	assert(dshot_edt_value(0xEA3) == 0xA3);
+	assert(dshot_reply_is_edt(DSHOT_EDT_OFF_REPLY));
+	assert(dshot_edt_type(DSHOT_EDT_OFF_REPLY) == DSHOT_EDT_STATUS);
+
+	/* eRPM over pole pairs [BF dshot.c:393-395]: 14 poles, 7 pairs */
+	assert(dshot_rpm(7000, 14) == 1000);
+	assert(dshot_rpm(7003, 14) == 1000);	/* 1000.43 */
+	assert(dshot_rpm(7004, 14) == 1001);	/* 1000.57 */
+	assert(dshot_rpm(58594, 14) == 8371);
+	assert(dshot_rpm(100, 2) == 100);
+	/* 1000 rpm is 104.72 rad/s */
+	assert(fabsf(dshot_erpm_to_rad_s(7000, 14) - 104.7198f) < 1e-3f);
+}
+
 int main(void)
 {
 	test_crc_and_frame();
 	test_timing();
 	test_throttle();
 	test_reply();
+	test_reply_line();
+	test_edt_and_rpm();
 	printf("test_dshot_math: all passed\n");
 	return 0;
 }
