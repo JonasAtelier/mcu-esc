@@ -8,7 +8,9 @@
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/ledc.h"
+#include "driver/rmt_rx.h"
 #include "driver/rmt_tx.h"
+#include "hal/gpio_ll.h"
 #include "driver/spi_master.h"
 #include "driver/uart.h"
 #include "esp_log.h"
@@ -382,6 +384,64 @@ rmt_new_copy_encoder(const rmt_copy_encoder_config_t *config,
 __attribute__((weak)) esp_err_t rmt_del_encoder(rmt_encoder_handle_t encoder)
 {
 	(void)encoder;
+	abort();
+}
+
+__attribute__((weak)) esp_err_t
+rmt_tx_register_event_callbacks(rmt_channel_handle_t tx_channel,
+				const rmt_tx_event_callbacks_t *cbs,
+				void *user_data)
+{
+	(void)tx_channel;
+	(void)cbs;
+	(void)user_data;
+	abort();
+}
+
+__attribute__((weak)) esp_err_t
+rmt_new_rx_channel(const rmt_rx_channel_config_t *config,
+		   rmt_channel_handle_t *ret_chan)
+{
+	(void)config;
+	(void)ret_chan;
+	abort();
+}
+
+__attribute__((weak)) esp_err_t
+rmt_receive(rmt_channel_handle_t rx_channel, void *buffer, size_t buffer_size,
+	    const rmt_receive_config_t *config)
+{
+	(void)rx_channel;
+	(void)buffer;
+	(void)buffer_size;
+	(void)config;
+	abort();
+}
+
+__attribute__((weak)) esp_err_t
+rmt_rx_register_event_callbacks(rmt_channel_handle_t rx_channel,
+				const rmt_rx_event_callbacks_t *cbs,
+				void *user_data)
+{
+	(void)rx_channel;
+	(void)cbs;
+	(void)user_data;
+	abort();
+}
+
+gpio_dev_t GPIO;
+
+__attribute__((weak)) void gpio_ll_od_enable(gpio_dev_t *hw, uint32_t gpio_num)
+{
+	(void)hw;
+	(void)gpio_num;
+	abort();
+}
+
+__attribute__((weak)) void gpio_ll_od_disable(gpio_dev_t *hw, uint32_t gpio_num)
+{
+	(void)hw;
+	(void)gpio_num;
 	abort();
 }
 

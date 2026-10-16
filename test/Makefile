@@ -53,8 +53,9 @@ DSHOT := ../src/dshot/dshot.c
 MATH_TESTS  := test_dji_math test_ht03_math test_dshot_math test_names
 MODEL_TESTS := test_dji test_ht03
 ESP_TESTS   := $(addprefix esp/,test_core test_c615 test_dshot \
-		test_dshot_nosync test_port_esp)
-STM_TESTS   := $(addprefix stm/,test_core test_c615 test_dshot test_port_stm)
+		test_dshot_nosync test_dshot_c3 test_port_esp)
+STM_TESTS   := $(addprefix stm/,test_core test_c615 test_dshot \
+		test_dshot_nof4 test_port_stm)
 TESTS       := $(MATH_TESTS) $(MODEL_TESTS) $(ESP_TESTS) $(STM_TESTS)
 
 .PHONY: all clean test
@@ -75,11 +76,15 @@ esp/test_c615: esp/test_c615.c $(C615) $(ESP_CORE)
 esp/test_dshot: esp/test_dshot.c $(DSHOT) $(ESP_CORE)
 esp/test_dshot_nosync: esp/test_dshot_nosync.c $(DSHOT) $(ESP_CORE)
 esp/test_dshot_nosync: CPPFLAGS += -DSTUB_RMT_NO_TX_SYNCHRO
+esp/test_dshot_c3: esp/test_dshot_c3.c $(DSHOT) $(ESP_CORE)
+esp/test_dshot_c3: CPPFLAGS += -DSTUB_RMT_C3
 esp/test_port_esp: esp/test_port_esp.c $(ESP_CORE)
 
 stm/test_core: stm/test_core.c $(STM_CORE)
 stm/test_c615: stm/test_c615.c $(C615) $(STM_CORE)
 stm/test_dshot: stm/test_dshot.c $(DSHOT) $(STM_CORE)
+stm/test_dshot_nof4: stm/test_dshot_nof4.c $(DSHOT) $(STM_CORE)
+stm/test_dshot_nof4: CPPFLAGS += -DSTUB_NOT_F4
 stm/test_port_stm: stm/test_port_stm.c $(STM_CORE)
 
 $(MATH_TESTS) $(MODEL_TESTS) $(ESP_TESTS): CPPFLAGS += $(ESP_CPPFLAGS)

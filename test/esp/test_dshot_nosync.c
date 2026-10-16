@@ -26,6 +26,24 @@ int main(void)
 	assert(sent_frame(0) == 0x82C6);
 	dshot_del(&bus);
 	assert(live_channels == 0);
+
+	/* Bidirectional: one motor, its TX and RX channels */
+	bidir_config_for(&config, DSHOT_600, 2);
+	assert(dshot_init(&bus, &config) == -EOPNOTSUPP);
+	bidir_config_for(&config, DSHOT_600, 1);
+	assert(dshot_init(&bus, &config) == 0);
+	assert(live_channels == 2);
+	esc_answer[0] = answer_of(0x300);
+	assert(dshot_update(&bus, 0.001f) == 0);
+	assert(dshot_update(&bus, 0.001f) == 0);
+	{
+		uint32_t erpm;
+
+		assert(dshot_get_erpm(dshot_esc(&bus, 0), &erpm) == 0 &&
+		       erpm == 117188);
+	}
+	dshot_del(&bus);
+	assert(live_channels == 0);
 	printf("test_dshot_nosync (esp): all passed\n");
 	return 0;
 }

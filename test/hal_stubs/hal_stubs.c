@@ -268,3 +268,28 @@ HAL_TIM_DMABurst_WriteStop(TIM_HandleTypeDef *htim, uint32_t BurstRequestSrc)
 	(void)BurstRequestSrc;
 	abort();
 }
+
+__attribute__((weak)) HAL_StatusTypeDef HAL_DMA_Init(DMA_HandleTypeDef *hdma)
+{
+	(void)hdma;
+	abort();
+}
+
+__attribute__((weak)) HAL_StatusTypeDef
+HAL_DMA_Start_IT(DMA_HandleTypeDef *hdma, uint32_t SrcAddress,
+		 uint32_t DstAddress, uint32_t DataLength)
+{
+	(void)hdma;
+	(void)SrcAddress;
+	(void)DstAddress;
+	(void)DataLength;
+	abort();
+}
+
+__attribute__((weak)) HAL_StatusTypeDef HAL_DMA_Abort(DMA_HandleTypeDef *hdma)
+{
+	(void)hdma;
+	abort();
+}
+
+DMA_Stream_TypeDef stub_dma_streams[16];

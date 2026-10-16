@@ -11,6 +11,12 @@
 
 #include <stdint.h>
 
+/* stm32f4xx.h defines its family; the DShot port's bidirectional half
+ * builds only under it. STUB_NOT_F4 stands for any other family. */
+#ifndef STUB_NOT_F4
+#define STM32F4
+#endif
+
 typedef enum {
 	HAL_OK		= 0x00,
 	HAL_ERROR	= 0x01,
@@ -18,9 +24,15 @@ typedef enum {
 	HAL_TIMEOUT	= 0x03,
 } HAL_StatusTypeDef;
 
-/* A port is a register block on silicon; here it only needs an identity. */
+/*
+ * A port is a register block on silicon. Here it needs an identity, and
+ * for bidirectional DShot the mode, pull and input registers.
+ */
 typedef struct {
 	uint32_t id;
+	uint32_t MODER;
+	uint32_t PUPDR;
+	uint32_t IDR;
 } GPIO_TypeDef;
 
 typedef enum {
@@ -31,6 +43,10 @@ typedef enum {
 #define GPIO_PIN_0		((uint16_t)0x0001)
 #define GPIO_PIN_1		((uint16_t)0x0002)
 #define GPIO_PIN_4		((uint16_t)0x0010)
+#define GPIO_PIN_6		((uint16_t)0x0040)
+#define GPIO_PIN_7		((uint16_t)0x0080)
+#define GPIO_PIN_8		((uint16_t)0x0100)
+#define GPIO_PIN_9		((uint16_t)0x0200)
 #define GPIO_PIN_14		((uint16_t)0x4000)
 #define GPIO_PIN_15		((uint16_t)0x8000)
 
@@ -146,9 +162,18 @@ void stub_uart_flush(UART_HandleTypeDef *huart);
  * functions test-defined.
  */
 typedef struct {
+	uint32_t DIER;
+	uint32_t EGR;
+	uint32_t CCER;
 	uint32_t ARR;
 	uint32_t CCR1, CCR2, CCR3, CCR4;
+	uint32_t DCR;
+	uint32_t DMAR;
 } TIM_TypeDef;
+
+/* The F405 CMSIS header's bits. */
+#define TIM_EGR_UG			0x00000001U
+#define TIM_CCER_CC1P			0x00000002U
 
 /*
  * DMA: the handle's settings the DShot port checks and its state, values
@@ -170,22 +195,54 @@ typedef enum {
 	HAL_DMA_STATE_BUSY = 0x02U,
 } HAL_DMA_StateTypeDef;
 
+/*
+ * The streams: an identity and an address each, DMA1's below DMA2's as on
+ * the F405 (0x4002 6010 and 0x4002 6410); stub_dma_streams is in
+ * hal_stubs.c.
+ */
 typedef struct {
+	uint32_t CR;
+} DMA_Stream_TypeDef;
+
+extern DMA_Stream_TypeDef stub_dma_streams[16];
+#define DMA1_Stream5		(&stub_dma_streams[5])
+#define DMA2_Stream0		(&stub_dma_streams[8])
+#define DMA2_Stream1		(&stub_dma_streams[9])
+
+#define HAL_DMA_ERROR_NONE		0x00000000U
+#define HAL_DMA_ERROR_TE		0x00000001U
+#define HAL_DMA_ERROR_FE		0x00000002U
+#define HAL_DMA_ERROR_DME		0x00000004U
+
+typedef struct __DMA_HandleTypeDef {
+	DMA_Stream_TypeDef *Instance;
 	DMA_InitTypeDef Init;
 	HAL_DMA_StateTypeDef State;
+	uint32_t ErrorCode;
+	void *Parent;
+	void (*XferCpltCallback)(struct __DMA_HandleTypeDef *hdma);
+	void (*XferHalfCpltCallback)(struct __DMA_HandleTypeDef *hdma);
+	void (*XferErrorCallback)(struct __DMA_HandleTypeDef *hdma);
 } DMA_HandleTypeDef;
 
+#define DMA_PERIPH_TO_MEMORY		0x00000000U
 #define DMA_MEMORY_TO_PERIPH		0x00000040U
 #define DMA_PINC_DISABLE		0x00000000U
 #define DMA_PINC_ENABLE			0x00000200U
 #define DMA_MINC_ENABLE			0x00000400U
 #define DMA_PDATAALIGN_HALFWORD		0x00000800U
 #define DMA_PDATAALIGN_WORD		0x00001000U
+#define DMA_MDATAALIGN_HALFWORD		0x00002000U
 #define DMA_MDATAALIGN_WORD		0x00004000U
 #define DMA_NORMAL			0x00000000U
 #define DMA_CIRCULAR			0x00000100U
 
 HAL_DMA_StateTypeDef HAL_DMA_GetState(DMA_HandleTypeDef *hdma);
+HAL_StatusTypeDef HAL_DMA_Init(DMA_HandleTypeDef *hdma);
+HAL_StatusTypeDef HAL_DMA_Start_IT(DMA_HandleTypeDef *hdma,
+				   uint32_t SrcAddress, uint32_t DstAddress,
+				   uint32_t DataLength);
+HAL_StatusTypeDef HAL_DMA_Abort(DMA_HandleTypeDef *hdma);
 
 typedef struct {
 	TIM_TypeDef *Instance;
@@ -212,6 +269,10 @@ HAL_StatusTypeDef HAL_TIM_DMABurst_WriteStop(TIM_HandleTypeDef *htim,
 #define TIM_CHANNEL_4		0x0000000CU
 
 #define __HAL_TIM_GET_AUTORELOAD(__HANDLE__)	((__HANDLE__)->Instance->ARR)
+#define __HAL_TIM_ENABLE_DMA(__HANDLE__, __DMA__) \
+	((__HANDLE__)->Instance->DIER |= (__DMA__))
+#define __HAL_TIM_DISABLE_DMA(__HANDLE__, __DMA__) \
+	((__HANDLE__)->Instance->DIER &= ~(__DMA__))
 #define __HAL_TIM_SET_COMPARE(__HANDLE__, __CHANNEL__, __COMPARE__) \
 	(((__CHANNEL__) == TIM_CHANNEL_1) ? \
 	 ((__HANDLE__)->Instance->CCR1 = (__COMPARE__)) : \

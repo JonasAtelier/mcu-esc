@@ -11,6 +11,10 @@
  * driver/rmt_tx.h and driver/rmt_common.h: only what the DShot port uses. */
 
 typedef struct {
+	rmt_tx_done_callback_t on_trans_done;
+} rmt_tx_event_callbacks_t;
+
+typedef struct {
 	gpio_num_t gpio_num;
 	rmt_clock_source_t clk_src;
 	uint32_t resolution_hz;
@@ -55,5 +59,8 @@ esp_err_t rmt_new_sync_manager(const rmt_sync_manager_config_t *config,
 			       rmt_sync_manager_handle_t *ret_synchro);
 esp_err_t rmt_del_sync_manager(rmt_sync_manager_handle_t synchro);
 esp_err_t rmt_sync_reset(rmt_sync_manager_handle_t synchro);
+esp_err_t rmt_tx_register_event_callbacks(rmt_channel_handle_t tx_channel,
+					  const rmt_tx_event_callbacks_t *cbs,
+					  void *user_data);
 
 #endif

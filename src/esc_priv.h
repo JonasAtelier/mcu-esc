@@ -330,15 +330,27 @@ int esc_pwm_attach(struct esc_pwm *pwm, TIM_HandleTypeDef *tim,
  *            at once. Only on a chip with an RMT (SOC_RMT_SUPPORTED: not
  *            the C2), and more than one motor only where the RMT can start
  *            channels together (SOC_RMT_SUPPORT_TX_SYNCHRO: not the
- *            original ESP32). The line rests low.
+ *            original ESP32). The line rests low. Bidirectional: the TX
+ *            output inverted, so the line rests high, and an RMT RX channel
+ *            on the same GPIO, armed before each frame; the pin turns
+ *            open-drain when the frame is out, so the ESC can answer, and
+ *            push-pull again before the next.
  *   HAL:     the app's timer, one bit per counter period; its update DMA
  *            burst-writes CCR1-CCR4 (DCR base CCR1, 4 transfers) from a
  *            buffer of 16 rows of four compares and one row of zeros, so
- *            the line ends low. One stream for every motor.
+ *            the line ends low. One stream for every motor. Bidirectional
+ *            (STM32F4): outputs active-low, two rows of zeros, and once
+ *            they are out the same stream samples the pins' input register
+ *            at three times the reply's bit rate, the pins inputs with
+ *            pull-up meanwhile.
  *
- * esc_dshot_attach() checks and sets up, lines low; esc_dshot_busy() is
- * -EBUSY while the last frame is still going out; esc_dshot_send() puts
- * frames[0..count-1] out; esc_dshot_detach() stops and releases.
+ * esc_dshot_attach() checks and sets up, lines at rest; esc_dshot_busy() is
+ * -EBUSY while the last frame is still going out or its reply still due;
+ * esc_dshot_send() puts frames[0..count-1] out; esc_dshot_reply() hands
+ * over a motor's answer to the last frame as its 21 line bits -- -ENOENT
+ * when no frame has gone out since the last read, -ENODATA when the ESC
+ * said nothing, -EBADMSG for levels that are no reply; esc_dshot_detach()
+ * stops and releases.
  */
 #if (defined(ESP_PLATFORM) && SOC_RMT_SUPPORTED) || \
     (!defined(ESP_PLATFORM) && defined(HAL_TIM_MODULE_ENABLED) && \
@@ -368,6 +380,7 @@ int esc_dshot_attach(struct dshot_port *port,
 		     const struct dshot_config *config);
 int esc_dshot_busy(struct dshot_port *port);
 int esc_dshot_send(struct dshot_port *port, const uint16_t *frames);
+int esc_dshot_reply(struct dshot_port *port, uint8_t motor, uint32_t *raw);
 void esc_dshot_detach(struct dshot_port *port);
 #endif
 

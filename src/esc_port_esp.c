@@ -15,6 +15,10 @@
 #include "esc_priv.h"
 
 #ifdef ESC_HAVE_DSHOT
+#include "driver/rmt_rx.h"
+#include "esp_attr.h"
+#include "hal/gpio_ll.h"	/* gpio_ll_od_*(): inline, for the ISR */
+
 #include "dshot/dshot_math.h"
 #endif
 
@@ -407,6 +411,137 @@ void esc_pwm_stop(struct esc_pwm *pwm)
 #ifdef ESC_HAVE_DSHOT
 /* ------------------------------------------------------------- DShot -- */
 
+/*
+ * Bidirectional: a pulse shorter than this is a glitch to the receiver.
+ * The shortest real one is 375 ns, a 1's rest at DShot600 (3 ticks of
+ * 125 ns, esc_priv.h).
+ */
+#define DSHOT_GLITCH_NS		200
+
+/*
+ * Bidirectional: the frame is out, so let the line go for the ESC's reply
+ * [BW "Bidirectional DSHOT"]. Open-drain, the channel's output at rest --
+ * high, the inverted line's rest -- drives nothing, and the RX channel's
+ * pull-up holds the line until the ESC drives it. In the RMT's interrupt,
+ * so nothing from flash: the LL call is inline. context is the GPIO.
+ */
+static IRAM_ATTR bool esc_dshot_sent(rmt_channel_handle_t channel,
+				     const rmt_tx_done_event_data_t *event,
+				     void *context)
+{
+	(void)channel;
+	(void)event;
+	gpio_ll_od_enable(&GPIO, (uint32_t)(uintptr_t)context);
+	return false;
+}
+
+/*
+ * The RX channel has stopped: the line held one level for
+ * DSHOT_REPLY_WAIT_US. context is the motor's heard_symbols.
+ */
+static IRAM_ATTR bool esc_dshot_heard(rmt_channel_handle_t channel,
+				      const rmt_rx_done_event_data_t *event,
+				      void *context)
+{
+	(void)channel;
+	*(volatile int32_t *)context = (int32_t)event->num_symbols;
+	return false;
+}
+
+/* Motor i's RX channel on its GPIO, ready to receive; nothing on failure. */
+static int esc_dshot_add_receiver(struct dshot_port *port, uint8_t i)
+{
+	rmt_rx_channel_config_t receiver_cfg = {
+		.gpio_num = port->gpio[i],
+		.clk_src = RMT_CLK_SRC_DEFAULT,
+		.resolution_hz = DSHOT_RMT_HZ,
+		.mem_block_symbols = SOC_RMT_MEM_WORDS_PER_CHANNEL,
+	};
+	const rmt_rx_event_callbacks_t heard = {
+		.on_recv_done = esc_dshot_heard,
+	};
+	int ret;
+
+	ret = esc_errno(rmt_new_rx_channel(&receiver_cfg, &port->receiver[i]));
+	if (ret)
+		return ret;
+	ret = esc_errno(rmt_rx_register_event_callbacks(
+		port->receiver[i], &heard, (void *)&port->heard_symbols[i]));
+	if (!ret)
+		ret = esc_errno(rmt_enable(port->receiver[i]));
+	if (ret) {
+		rmt_del_channel(port->receiver[i]);
+		port->receiver[i] = NULL;
+	}
+	return ret;
+}
+
+/*
+ * Motor i: its TX channel, encoder and, bidirectional, the TX-done call
+ * and the receiver; nothing on failure. Bidirectional, the TX output is
+ * inverted: the same symbols, the line resting high.
+ */
+static int esc_dshot_add(struct dshot_port *port, uint8_t i)
+{
+	rmt_tx_channel_config_t channel_cfg = {
+		.gpio_num = port->gpio[i],
+		.clk_src = RMT_CLK_SRC_DEFAULT,
+		.resolution_hz = DSHOT_RMT_HZ,
+		.mem_block_symbols = SOC_RMT_MEM_WORDS_PER_CHANNEL,
+		.trans_queue_depth = 1,
+	};
+	const rmt_tx_event_callbacks_t sent = {
+		.on_trans_done = esc_dshot_sent,
+	};
+	/* Empty in IDF: no initialiser fits both it and -pedantic. */
+	rmt_copy_encoder_config_t encoder_cfg;
+	int ret;
+
+	channel_cfg.flags.invert_out = port->bidirectional;
+	memset(&encoder_cfg, 0, sizeof(encoder_cfg));
+	ret = esc_errno(rmt_new_tx_channel(&channel_cfg, &port->channel[i]));
+	if (ret)
+		return ret;
+	ret = esc_errno(rmt_new_copy_encoder(&encoder_cfg, &port->encoder[i]));
+	if (ret) {
+		rmt_del_channel(port->channel[i]);
+		return ret;
+	}
+	if (port->bidirectional)
+		ret = esc_errno(rmt_tx_register_event_callbacks(
+			port->channel[i], &sent,
+			(void *)(uintptr_t)port->gpio[i]));
+	if (!ret)
+		ret = esc_errno(rmt_enable(port->channel[i]));
+	if (ret) {
+		rmt_del_encoder(port->encoder[i]);
+		rmt_del_channel(port->channel[i]);
+		return ret;
+	}
+	if (port->bidirectional) {
+		ret = esc_dshot_add_receiver(port, i);
+		if (ret) {
+			rmt_disable(port->channel[i]);
+			rmt_del_encoder(port->encoder[i]);
+			rmt_del_channel(port->channel[i]);
+		}
+	}
+	return ret;
+}
+
+/* Undo esc_dshot_add() for motor i. */
+static void esc_dshot_remove(struct dshot_port *port, uint8_t i)
+{
+	if (port->receiver[i]) {
+		rmt_disable(port->receiver[i]);
+		rmt_del_channel(port->receiver[i]);
+		port->receiver[i] = NULL;
+	}
+	rmt_disable(port->channel[i]);
+	rmt_del_encoder(port->encoder[i]);
+	rmt_del_channel(port->channel[i]);
+}
+
 /* The bit and high ticks at DSHOT_RMT_HZ are worked out in esc_priv.h. */
 int esc_dshot_attach(struct dshot_port *port,
 		     const struct dshot_config *config)
@@ -422,36 +557,24 @@ int esc_dshot_attach(struct dshot_port *port,
 	if (config->count > 1)
 		return -EOPNOTSUPP;
 #endif
+	/*
+	 * Bidirectional: an RX channel per motor besides its TX channel. The
+	 * ESP32's and S2's channels each do either, so that is two of them a
+	 * motor; elsewhere RX channels are their own (soc_caps.h).
+	 */
+	if (config->bidirectional &&
+	    (config->count > SOC_RMT_RX_CANDIDATES_PER_GROUP ||
+	     2 * config->count > SOC_RMT_CHANNELS_PER_GROUP))
+		return -EOPNOTSUPP;
 	port->bit_ticks = dshot_bit_ticks(DSHOT_RMT_HZ, config->speed);
+	port->speed = config->speed;
+	port->bidirectional = config->bidirectional;
+	memcpy(port->gpio, config->gpio, sizeof(port->gpio));
 
 	for (i = 0; i < config->count; i++) {
-		rmt_tx_channel_config_t channel_cfg = {
-			.gpio_num = config->gpio[i],
-			.clk_src = RMT_CLK_SRC_DEFAULT,
-			.resolution_hz = DSHOT_RMT_HZ,
-			.mem_block_symbols = SOC_RMT_MEM_WORDS_PER_CHANNEL,
-			.trans_queue_depth = 1,
-		};
-		/* Empty in IDF: no initialiser fits both it and -pedantic. */
-		rmt_copy_encoder_config_t encoder_cfg;
-
-		memset(&encoder_cfg, 0, sizeof(encoder_cfg));
-		ret = esc_errno(rmt_new_tx_channel(&channel_cfg,
-						   &port->channel[i]));
+		ret = esc_dshot_add(port, i);
 		if (ret)
 			break;
-		ret = esc_errno(rmt_new_copy_encoder(&encoder_cfg,
-						     &port->encoder[i]));
-		if (ret) {
-			rmt_del_channel(port->channel[i]);
-			break;
-		}
-		ret = esc_errno(rmt_enable(port->channel[i]));
-		if (ret) {
-			rmt_del_encoder(port->encoder[i]);
-			rmt_del_channel(port->channel[i]);
-			break;
-		}
 	}
 #if SOC_RMT_SUPPORT_TX_SYNCHRO
 	if (!ret && config->count > 1) {
@@ -464,12 +587,9 @@ int esc_dshot_attach(struct dshot_port *port,
 	}
 #endif
 	if (ret) {
-		/* Undo channels 0..i-1, all set up in full. */
-		while (i--) {
-			rmt_disable(port->channel[i]);
-			rmt_del_encoder(port->encoder[i]);
-			rmt_del_channel(port->channel[i]);
-		}
+		/* Undo motors 0..i-1, all set up in full. */
+		while (i--)
+			esc_dshot_remove(port, i);
 		return ret;
 	}
 	port->count = config->count;
@@ -478,10 +598,27 @@ int esc_dshot_attach(struct dshot_port *port,
 
 int esc_dshot_busy(struct dshot_port *port)
 {
-	for (uint8_t i = 0; i < port->count; i++)
+	for (uint8_t i = 0; i < port->count; i++) {
 		if (rmt_tx_wait_all_done(port->channel[i], 0) != ESP_OK)
 			return -EBUSY;
+		if (port->bidirectional && port->heard_symbols[i] < 0)
+			return -EBUSY;
+	}
 	return 0;
+}
+
+/*
+ * Stop a receive that will hear nothing: disabling an RX channel stops it
+ * (IDF v5.5.5 rmt_rx.c, rmt_rx_disable()); enabling it again leaves it
+ * ready for the next.
+ */
+static void esc_dshot_stop_listening(struct dshot_port *port, uint8_t count)
+{
+	for (uint8_t i = 0; i < count; i++) {
+		rmt_disable(port->receiver[i]);
+		rmt_enable(port->receiver[i]);
+		port->heard_symbols[i] = 0;
+	}
 }
 
 /*
@@ -489,7 +626,8 @@ int esc_dshot_busy(struct dshot_port *port)
  * that, under the sync manager, waits for the rest forever -- and keeps
  * them busy. Disabling a channel stops it and drops its transaction (IDF
  * v5.5.5 rmt_tx.c, rmt_tx_disable()); enabling it again and resetting the
- * sync manager leaves all of them as before the send.
+ * sync manager leaves all of them as before the send. Bidirectional,
+ * every receiver was armed and hears nothing now.
  */
 static void esc_dshot_cancel(struct dshot_port *port, uint8_t sent)
 {
@@ -501,13 +639,44 @@ static void esc_dshot_cancel(struct dshot_port *port, uint8_t sent)
 	if (port->sync)
 		rmt_sync_reset(port->sync);
 #endif
+	if (port->bidirectional)
+		esc_dshot_stop_listening(port, port->count);
+}
+
+/*
+ * Bidirectional, before the frame: each pin push-pull again for it, and
+ * its receiver armed, to hear the frame and the reply after it and stop
+ * once the line has rested DSHOT_REPLY_WAIT_US.
+ */
+static int esc_dshot_listen(struct dshot_port *port)
+{
+	const rmt_receive_config_t receive_cfg = {
+		.signal_range_min_ns = DSHOT_GLITCH_NS,
+		.signal_range_max_ns = DSHOT_REPLY_WAIT_US * 1000u,
+	};
+	int ret;
+
+	for (uint8_t i = 0; i < port->count; i++) {
+		gpio_ll_od_disable(&GPIO, (uint32_t)port->gpio[i]);
+		port->heard_symbols[i] = -1;
+		ret = esc_errno(rmt_receive(port->receiver[i], port->heard[i],
+					    sizeof(port->heard[i]),
+					    &receive_cfg));
+		if (ret) {
+			port->heard_symbols[i] = 0;
+			esc_dshot_stop_listening(port, i);
+			return ret;
+		}
+	}
+	return 0;
 }
 
 /*
  * Sixteen symbols a motor, high for a 1's or a 0's time, then low for the
- * rest of the bit; the channel rests low after the last one (eot_level 0).
- * The symbols stay in the port until the next send: the copy encoder may
- * read them after rmt_transmit() has returned.
+ * rest of the bit; the channel rests low after the last one (eot_level 0),
+ * and bidirectional the output inverts all of it. The symbols stay in the
+ * port until the next send: the copy encoder may read them after
+ * rmt_transmit() has returned.
  */
 int esc_dshot_send(struct dshot_port *port, const uint16_t *frames)
 {
@@ -523,6 +692,12 @@ int esc_dshot_send(struct dshot_port *port, const uint16_t *frames)
 			return ret;
 	}
 #endif
+	port->unread = 0;
+	if (port->bidirectional) {
+		ret = esc_dshot_listen(port);
+		if (ret)
+			return ret;
+	}
 	for (uint8_t i = 0; i < port->count; i++) {
 		for (int bit = 0; bit < DSHOT_FRAME_BITS; bit++) {
 			bool set = frames[i] & (0x8000u >> bit);
@@ -543,6 +718,51 @@ int esc_dshot_send(struct dshot_port *port, const uint16_t *frames)
 			return ret;
 		}
 	}
+	if (port->bidirectional)
+		port->unread = (uint8_t)((1u << port->count) - 1);
+	return 0;
+}
+
+/*
+ * What motor's receiver heard, as alternating levels in RMT symbols: the
+ * frame, the line at rest longer than any level inside a reply, then the
+ * reply, falling first, and the rest that stopped the receiver. A
+ * duration of 0 ends the symbols.
+ */
+int esc_dshot_reply(struct dshot_port *port, uint8_t motor, uint32_t *raw)
+{
+	const rmt_symbol_word_t *heard = port->heard[motor];
+	uint32_t symbols = (uint32_t)port->heard_symbols[motor];
+	uint32_t value = 0, bits = 0;
+	bool in_reply = false;
+	int ret;
+
+	if (!(port->unread & (1u << motor)))
+		return -ENOENT;
+	port->unread &= (uint8_t)~(1u << motor);
+	if (symbols > sizeof(port->heard[0]) / sizeof(port->heard[0][0]))
+		symbols = sizeof(port->heard[0]) / sizeof(port->heard[0][0]);
+	for (uint32_t half = 0; half < 2 * symbols; half++) {
+		const rmt_symbol_word_t *symbol = &heard[half / 2];
+		uint32_t ticks = half % 2 ? symbol->duration1 :
+					    symbol->duration0;
+		bool high = half % 2 ? symbol->level1 : symbol->level0;
+		uint32_t count;
+
+		if (!ticks)
+			break;
+		count = dshot_reply_run_bits(ticks, DSHOT_RMT_HZ, port->speed);
+		if (!in_reply) {
+			in_reply = high && count > DSHOT_REPLY_RUN_MAX + 1;
+			continue;
+		}
+		ret = dshot_reply_append(&value, &bits, high, count);
+		if (ret)
+			return ret;
+	}
+	if (!bits)
+		return -ENODATA;
+	*raw = dshot_reply_finish(value, bits);
 	return 0;
 }
 
@@ -552,11 +772,8 @@ void esc_dshot_detach(struct dshot_port *port)
 	if (port->sync)
 		rmt_del_sync_manager(port->sync);
 #endif
-	for (uint8_t i = 0; i < port->count; i++) {
-		rmt_disable(port->channel[i]);
-		rmt_del_encoder(port->encoder[i]);
-		rmt_del_channel(port->channel[i]);
-	}
+	for (uint8_t i = 0; i < port->count; i++)
+		esc_dshot_remove(port, i);
 	port->sync = NULL;
 	port->count = 0;
 }

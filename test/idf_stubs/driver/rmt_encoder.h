@@ -1,6 +1,8 @@
 #ifndef RMT_ENCODER_H
 #define RMT_ENCODER_H
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -32,6 +34,27 @@ typedef union {
 typedef struct {
 	int unused;	/* empty in IDF; C forbids that without GNU */
 } rmt_copy_encoder_config_t;
+
+/* The event data and callbacks, driver/rmt_types.h. */
+typedef struct {
+	size_t num_symbols;
+} rmt_tx_done_event_data_t;
+
+typedef bool (*rmt_tx_done_callback_t)(rmt_channel_handle_t tx_chan,
+				       const rmt_tx_done_event_data_t *edata,
+				       void *user_ctx);
+
+typedef struct {
+	rmt_symbol_word_t *received_symbols;
+	size_t num_symbols;
+	struct {
+		uint32_t is_last : 1;
+	} flags;
+} rmt_rx_done_event_data_t;
+
+typedef bool (*rmt_rx_done_callback_t)(rmt_channel_handle_t rx_chan,
+				       const rmt_rx_done_event_data_t *edata,
+				       void *user_ctx);
 
 esp_err_t rmt_new_copy_encoder(const rmt_copy_encoder_config_t *config,
 			       rmt_encoder_handle_t *ret_encoder);

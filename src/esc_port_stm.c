@@ -385,6 +385,230 @@ void esc_pwm_stop(struct esc_pwm *pwm)
 
 #define DSHOT_BURST_ROWS	(DSHOT_FRAME_BITS + 1)
 
+/*
+ * Bidirectional DShot on the STM32F4 only: the update DMA reads the pins'
+ * port, which takes DMA2 -- only its peripheral port reaches the bus
+ * matrix and so the AHB1 GPIO (RM0090 2.1.5, p.52; Figure 25 note 1,
+ * p.214) -- and RM0090 is the manual this was checked against. Elsewhere
+ * it is -EOPNOTSUPP.
+ */
+#if defined(STM32F4)
+#define ESC_HAVE_DSHOT_BIDIR
+#endif
+
+#ifdef ESC_HAVE_DSHOT_BIDIR
+/*
+ * Two rows of zeros: the transfer-complete interrupt comes when the last
+ * row has been moved, one period before it is put out (see
+ * esc_dshot_send()), so with two the line is at rest by then.
+ */
+#define DSHOT_BIDIR_BURST_ROWS	(DSHOT_FRAME_BITS + 2)
+
+enum {
+	DSHOT_IDLE,
+	DSHOT_SENDING,		/* the burst is going out */
+	DSHOT_SAMPLING,		/* the DMA reads the port */
+};
+
+/* GPIOx_MODER and GPIOx_PUPDR, two bits a pin (RM0090 7.4.1, p.198;
+ * 7.4.4, p.200). */
+#define DSHOT_MODER_INPUT	0u
+#define DSHOT_MODER_ALTERNATE	2u
+#define DSHOT_PUPDR_PULL_UP	1u
+
+/* GPIO_PIN_x to its number 0-15, or -1 for not one pin. */
+static int esc_dshot_pin_number(uint16_t pin)
+{
+	for (int n = 0; n < 16; n++)
+		if (pin == (1u << n))
+			return n;
+	return -1;
+}
+
+/* Every motor's pin to mode, DSHOT_MODER_*. In the DMA's interrupt too. */
+static void esc_dshot_pins(struct dshot_port *port, uint32_t mode)
+{
+	uint32_t moder = port->gpio->MODER;
+
+	for (uint8_t i = 0; i < port->count; i++)
+		moder = (moder & ~(3u << (2 * port->pin[i]))) |
+			(mode << (2 * port->pin[i]));
+	port->gpio->MODER = moder;
+}
+
+/*
+ * The timer to a counter period of ticks, at once: UG reloads the counter
+ * and ARR (RM0090 14.4.6, p.399), and with UDE off asks the DMA nothing.
+ */
+static void esc_dshot_period(struct dshot_port *port, uint32_t ticks)
+{
+	__HAL_TIM_DISABLE_DMA(port->tim, TIM_DMA_UPDATE);
+	port->tim->Instance->ARR = ticks - 1u;
+	port->tim->Instance->EGR = TIM_EGR_UG;
+}
+
+/* The DMA's settings: word to the timer for a frame, half-word from the
+ * port for samples (GPIO registers take either, RM0090 7.4, p.198). */
+static HAL_StatusTypeDef esc_dshot_dma_mode(DMA_HandleTypeDef *dma,
+					    bool sampling)
+{
+	dma->Init.Direction = sampling ? DMA_PERIPH_TO_MEMORY :
+					 DMA_MEMORY_TO_PERIPH;
+	dma->Init.PeriphDataAlignment = sampling ? DMA_PDATAALIGN_HALFWORD :
+						   DMA_PDATAALIGN_WORD;
+	dma->Init.MemDataAlignment = sampling ? DMA_MDATAALIGN_HALFWORD :
+						DMA_MDATAALIGN_WORD;
+	return HAL_DMA_Init(dma);
+}
+
+/*
+ * Back to sending: compares 0, so the line rests even when a frame was cut
+ * short (UG below makes them active at once), bit period, pins to the
+ * timer, DMA to the timer. From the DMA's interrupt, or after a failure; a
+ * DMA init that fails here makes the next send fail.
+ */
+static void esc_dshot_rest(struct dshot_port *port)
+{
+	for (uint8_t i = 0; i < port->count; i++)
+		__HAL_TIM_SET_COMPARE(port->tim, port->channel[i], 0);
+	esc_dshot_period(port, port->bit_ticks);
+	esc_dshot_pins(port, DSHOT_MODER_ALTERNATE);
+	esc_dshot_dma_mode(port->tim->hdma[TIM_DMA_ID_UPDATE], false);
+	port->phase = DSHOT_IDLE;
+}
+
+/* The samples are in. */
+static void esc_dshot_sampled(DMA_HandleTypeDef *dma)
+{
+	struct dshot_port *port = dma->Parent;
+
+	port->sampled = true;
+	esc_dshot_rest(port);
+}
+
+/*
+ * A DMA error, sending or sampling. Only a transfer error stops the
+ * stream (stm32f4xx_hal_dma.c, HAL_DMA_IRQHandler(): FIFO and direct-mode
+ * errors leave it running); then no reply this time. Anything else is
+ * left to finish as it was.
+ */
+static void esc_dshot_dma_failed(DMA_HandleTypeDef *dma)
+{
+	if (!(dma->ErrorCode & HAL_DMA_ERROR_TE))
+		return;
+	esc_dshot_rest(dma->Parent);
+}
+
+/*
+ * The frame is out and the line at rest: let it go for the ESC's reply
+ * [BW "Bidirectional DSHOT"] -- pins to inputs, held high by their
+ * pull-ups -- and read the port every sample_ticks into samples[], by the
+ * same update DMA. In the DMA's interrupt; the reply starts 30 us later.
+ */
+static void esc_dshot_frame_out(DMA_HandleTypeDef *dma)
+{
+	struct dshot_port *port = dma->Parent;
+
+	esc_dshot_period(port, port->sample_ticks);
+	esc_dshot_pins(port, DSHOT_MODER_INPUT);
+	dma->XferCpltCallback = esc_dshot_sampled;
+	port->phase = DSHOT_SAMPLING;
+	if (esc_dshot_dma_mode(dma, true) != HAL_OK ||
+	    HAL_DMA_Start_IT(dma, (uint32_t)(uintptr_t)&port->gpio->IDR,
+			     (uint32_t)(uintptr_t)port->samples,
+			     port->sample_count) != HAL_OK) {
+		esc_dshot_rest(port);
+		return;
+	}
+	__HAL_TIM_ENABLE_DMA(port->tim, TIM_DMA_UPDATE);
+}
+
+/*
+ * Bidirectional setup: the pins, each once and on one port, with
+ * pull-ups; the channels active-low, so compare 0 holds the line high
+ * (CCxP, RM0090 14.4.9, p.405; PWM mode 1, 14.4.7, p.402); the sample
+ * period, 1/3 of a reply bit, and how many samples cover
+ * DSHOT_REPLY_WAIT_US and a reply and one bit more; and the DMA handle's
+ * Parent, which its callbacks find the port by.
+ */
+static int esc_dshot_bidir_attach(struct dshot_port *port,
+				  const struct dshot_config *config)
+{
+	const uint32_t per_sample = DSHOT_REPLY_RATE_NUM * DSHOT_REPLY_OVERSAMPLE;
+	uint16_t used = 0;
+	uint64_t window;
+
+	/*
+	 * The GPIO is on AHB1, which only DMA2's peripheral port reaches
+	 * (RM0090 2.1.5, p.52; Figure 25 note 1, p.214): DMA1, at 0x4002 6000,
+	 * lies below DMA2, at 0x4002 6400 (Table 2, p.53). TIM1 and TIM8 have
+	 * their update request on DMA2 (Table 34, p.217), TIM2-5 on DMA1 (Table
+	 * 33, p.216).
+	 */
+	if ((uintptr_t)port->tim->hdma[TIM_DMA_ID_UPDATE]->Instance <
+	    (uintptr_t)DMA2_Stream0)
+		return -EOPNOTSUPP;
+	if (!config->gpio)
+		return -EINVAL;
+	for (uint8_t i = 0; i < config->count; i++) {
+		int n = esc_dshot_pin_number(config->pin[i]);
+
+		if (n < 0 || (used & config->pin[i]))
+			return -EINVAL;
+		used |= config->pin[i];
+		port->pin[i] = (uint8_t)n;
+	}
+	port->sample_ticks = (port->bit_ticks * DSHOT_REPLY_RATE_DEN +
+			      per_sample / 2) / per_sample;
+	window = (uint64_t)config->tick_hz * DSHOT_REPLY_WAIT_US / 1000000u +
+		 (uint64_t)(DSHOT_REPLY_BITS + 1) * port->bit_ticks *
+		 DSHOT_REPLY_RATE_DEN / DSHOT_REPLY_RATE_NUM;
+	if (!port->sample_ticks)
+		return -EINVAL;
+	window = (window + port->sample_ticks - 1) / port->sample_ticks;
+	if (window > sizeof(port->samples) / sizeof(port->samples[0]))
+		return -EINVAL;
+	port->sample_count = (uint16_t)window;
+	port->gpio = config->gpio;
+	port->tick_hz = config->tick_hz;
+
+	for (uint8_t i = 0; i < config->count; i++) {
+		uint32_t shift = 2u * port->pin[i];
+
+		port->gpio->PUPDR = (port->gpio->PUPDR & ~(3u << shift)) |
+				    (DSHOT_PUPDR_PULL_UP << shift);
+		port->tim->Instance->CCER |= TIM_CCER_CC1P << (4 * port->slot[i]);
+	}
+	port->tim->hdma[TIM_DMA_ID_UPDATE]->Parent = port;
+	port->phase = DSHOT_IDLE;
+	return 0;
+}
+
+/*
+ * Undo the bidirectional setup, whatever is under way stopped first: the
+ * timer, pins and DMA as the app set them -- but for the pull-ups, which
+ * stay -- and the handle's Parent the timer again, as the HAL links it.
+ */
+static void esc_dshot_bidir_detach(struct dshot_port *port)
+{
+	DMA_HandleTypeDef *dma = port->tim->hdma[TIM_DMA_ID_UPDATE];
+
+	if (!port->gpio)
+		return;
+	__HAL_TIM_DISABLE_DMA(port->tim, TIM_DMA_UPDATE);
+	HAL_DMA_Abort(dma);
+	esc_dshot_rest(port);
+	for (uint8_t i = 0; i < port->count; i++)
+		port->tim->Instance->CCER &=
+			~(TIM_CCER_CC1P << (4 * port->slot[i]));
+	dma->XferCpltCallback = NULL;
+	dma->XferErrorCallback = NULL;
+	dma->Parent = port->tim;
+	port->gpio = NULL;
+	port->bidirectional = false;
+}
+#endif /* ESC_HAVE_DSHOT_BIDIR */
+
 /* TIM_CHANNEL_1..4 as CCR1..4's place in a burst row, or -1. */
 static int esc_dshot_slot(uint32_t channel)
 {
@@ -440,6 +664,21 @@ int esc_dshot_attach(struct dshot_port *port,
 	port->bit_ticks = __HAL_TIM_GET_AUTORELOAD(tim) + 1u;
 	if (port->bit_ticks != dshot_bit_ticks(config->tick_hz, config->speed))
 		return -EINVAL;
+	port->speed = config->speed;
+	port->tim = tim;
+	port->count = config->count;
+	if (config->bidirectional) {
+#ifdef ESC_HAVE_DSHOT_BIDIR
+		ret = esc_dshot_bidir_attach(port, config);
+#else
+		ret = -EOPNOTSUPP;
+#endif
+		if (ret) {
+			port->count = 0;
+			return ret;
+		}
+		port->bidirectional = true;
+	}
 
 	for (i = 0; i < config->count; i++) {
 		__HAL_TIM_SET_COMPARE(tim, config->channel[i], 0);
@@ -450,10 +689,12 @@ int esc_dshot_attach(struct dshot_port *port,
 	if (ret) {
 		while (i--)
 			HAL_TIM_PWM_Stop(tim, config->channel[i]);
+#ifdef ESC_HAVE_DSHOT_BIDIR
+		esc_dshot_bidir_detach(port);
+#endif
+		port->count = 0;
 		return ret;
 	}
-	port->tim = tim;
-	port->count = config->count;
 	return 0;
 }
 
@@ -463,11 +704,106 @@ int esc_dshot_attach(struct dshot_port *port,
  */
 int esc_dshot_busy(struct dshot_port *port)
 {
+#ifdef ESC_HAVE_DSHOT_BIDIR
+	if (port->bidirectional)
+		return port->phase == DSHOT_IDLE ? 0 : -EBUSY;
+#endif
 	if (HAL_DMA_GetState(port->tim->hdma[TIM_DMA_ID_UPDATE]) ==
 	    HAL_DMA_STATE_BUSY)
 		return -EBUSY;
 	return 0;
 }
+
+#ifdef ESC_HAVE_DSHOT_BIDIR
+/*
+ * The same burst as below, but started on the DMA directly: the HAL's
+ * burst call would take the transfer-complete callback, and here that
+ * callback turns the line round (esc_dshot_frame_out()). DCR as below.
+ */
+static int esc_dshot_send_bidir(struct dshot_port *port)
+{
+	DMA_HandleTypeDef *dma = port->tim->hdma[TIM_DMA_ID_UPDATE];
+	int ret;
+
+	port->unread = 0;
+	port->sampled = false;
+	dma->XferCpltCallback = esc_dshot_frame_out;
+	dma->XferHalfCpltCallback = NULL;
+	dma->XferErrorCallback = esc_dshot_dma_failed;
+	port->tim->Instance->DCR = TIM_DMABASE_CCR1 |
+				   TIM_DMABURSTLENGTH_4TRANSFERS;
+	port->phase = DSHOT_SENDING;
+	ret = esc_hal_errno(HAL_DMA_Start_IT(
+		dma, (uint32_t)(uintptr_t)port->burst,
+		(uint32_t)(uintptr_t)&port->tim->Instance->DMAR,
+		DSHOT_BIDIR_BURST_ROWS * 4));
+	if (ret) {
+		port->phase = DSHOT_IDLE;
+		return ret;
+	}
+	__HAL_TIM_ENABLE_DMA(port->tim, TIM_DMA_UPDATE);
+	port->unread = (uint8_t)((1u << port->count) - 1);
+	return 0;
+}
+
+/*
+ * The samples of motor's pin: high while the line rests after the frame,
+ * then the reply, falling first; each level's length in samples is
+ * sample_ticks apiece.
+ */
+int esc_dshot_reply(struct dshot_port *port, uint8_t motor, uint32_t *raw)
+{
+	uint16_t mask = (uint16_t)(1u << port->pin[motor]);
+	uint32_t value = 0, bits = 0, run = 0;
+	bool in_reply = false, level = false;
+	int ret;
+
+	if (!(port->unread & (1u << motor)))
+		return -ENOENT;
+	port->unread &= (uint8_t)~(1u << motor);
+	if (!port->sampled)
+		return -ENODATA;
+	for (uint16_t n = 0; n < port->sample_count; n++) {
+		bool high = port->samples[n] & mask;
+
+		if (!in_reply) {
+			in_reply = !high;
+			run = in_reply;
+			continue;
+		}
+		if (high == level) {
+			run++;
+			continue;
+		}
+		ret = dshot_reply_append(&value, &bits, level,
+					 dshot_reply_run_bits(
+						 run * port->sample_ticks,
+						 port->tick_hz, port->speed));
+		if (ret)
+			return ret;
+		level = high;
+		run = 1;
+	}
+	if (!in_reply)
+		return -ENODATA;
+	ret = dshot_reply_append(&value, &bits, level,
+				 dshot_reply_run_bits(run * port->sample_ticks,
+						      port->tick_hz,
+						      port->speed));
+	if (ret)
+		return ret;
+	*raw = dshot_reply_finish(value, bits);
+	return 0;
+}
+#else
+int esc_dshot_reply(struct dshot_port *port, uint8_t motor, uint32_t *raw)
+{
+	(void)port;
+	(void)motor;
+	(void)raw;
+	return -ENOENT;
+}
+#endif
 
 /*
  * Row b holds bit b's high time for every motor's CCR, the last row zeros:
@@ -502,6 +838,10 @@ int esc_dshot_send(struct dshot_port *port, const uint16_t *frames)
 			port->burst[bit * 4 + port->slot[i]] =
 				(frames[i] & (0x8000u >> bit)) ? one : zero;
 
+#ifdef ESC_HAVE_DSHOT_BIDIR
+	if (port->bidirectional)
+		return esc_dshot_send_bidir(port);
+#endif
 	HAL_TIM_DMABurst_WriteStop(port->tim, TIM_DMA_UPDATE);
 	return esc_hal_errno(HAL_TIM_DMABurst_MultiWriteStart(
 		port->tim, TIM_DMABASE_CCR1, TIM_DMA_UPDATE, port->burst,
@@ -510,6 +850,9 @@ int esc_dshot_send(struct dshot_port *port, const uint16_t *frames)
 
 void esc_dshot_detach(struct dshot_port *port)
 {
+#ifdef ESC_HAVE_DSHOT_BIDIR
+	esc_dshot_bidir_detach(port);
+#endif
 	HAL_TIM_DMABurst_WriteStop(port->tim, TIM_DMA_UPDATE);
 	for (uint8_t i = 0; i < port->count; i++) {
 		__HAL_TIM_SET_COMPARE(port->tim, port->channel[i], 0);
