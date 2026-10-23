@@ -28,25 +28,120 @@ forge package key are `esc`.
 > **Hardware unverified.** Host tests use a fake CAN bus, fake LEDC and TIM
 > drivers and platform stubs. Nothing here has turned a motor.
 
-[Supported hardware](#supported-hardware) · [Install](#install) ·
+[Supported hardware](#supported-hardware) · [Drivers](#drivers) ·
+[Install](#install) ·
 [Quick start](#quick-start) · [Examples](#examples) ·
 [Documentation](#documentation) · [Tests](#tests) · [License](#license)
 
 ## Supported hardware
 
-| Model | Motor | Link | Command | Feedback |
-|---|---|---|---|---|
-| **DJI C610** | M2006 | CAN, 1 Mbit/s | current, +-10 A | angle, position, velocity |
-| **DJI C620** | M3508 | CAN, 1 Mbit/s | current, +-20 A | angle, position, velocity, temperature |
-| **DJI GM6020** | built in | CAN, 1 Mbit/s | current +-3 A, or voltage in raw counts | angle, position, velocity |
-| **DJI C615** | Snail 2305 and others | PWM, 400-2200 us, up to 500 Hz | throttle 0..1 | none |
-| **Haitai HT-03** | HT8108-J6, built in | CAN, 1 Mbit/s, MIT protocol | torque; the full MIT command | position, velocity, torque |
-| **DShot ESCs** | any | DShot150/300/600, up to 4: RMT on the ESP32-S2, S3, C3, C5, C6, H2, P4 (one motor on the ESP32, none on the C2); STM32 timer + DMA | throttle 0..1, raw value, special commands | bidirectional (300 and up): eRPM, RPM, velocity; with EDT temperature, voltage, current, debug, status -- ESP32 RMT (2 motors on the S2, C3, C5, C6, H2), STM32F4 |
+| Model | Link | Notes |
+|---|---|---|
+| **DJI C610** | CAN | DJI ESC for the M2006 |
+| **DJI C620** | CAN | DJI ESC for the M3508 |
+| **DJI GM6020** | CAN | DJI motor with its ESC built in |
+| **DJI C615** | PWM | DJI PWM ESC |
+| **Haitai HT-03** | CAN | Haitai motor with its driver built in |
+| **DShot ESCs** | DShot | any ESC that speaks DShot |
 
 One Kconfig option per model: `ESC_C610`, `ESC_C620`, `ESC_GM6020`,
 `ESC_C615`, `ESC_HT03`, `ESC_DSHOT`. Every number is cited to its manual in the
 [model reference](docs/chips.md); wiring is in the
 [hardware guide](docs/hardware.md).
+
+## Drivers
+
+<details><summary><b>DJI C610</b> — CAN</summary>
+
+- Motor: M2006
+- Link: CAN, 1 Mbit/s
+- Command: current, +-10 A
+- Feedback: angle, position, velocity
+- Examples (with a C620): ESP-IDF none · STM32 HAL
+  [dji_bxcan](examples/stm/dji_bxcan/main.c), on bxCAN
+- Chip reference: [DJI CAN frames](docs/chips.md#dji-can-frames)
+
+</details>
+
+<details><summary><b>DJI C620</b> — CAN</summary>
+
+- Motor: M3508
+- Link: CAN, 1 Mbit/s
+- Command: current, +-20 A
+- Feedback: angle, position, velocity, temperature
+- Examples (with a GM6020): ESP-IDF [dji](examples/esp/dji/), on the TWAI ·
+  STM32 HAL none
+- Examples (with a C610): ESP-IDF none · STM32 HAL
+  [dji_bxcan](examples/stm/dji_bxcan/main.c), on bxCAN
+- Chip reference: [DJI CAN frames](docs/chips.md#dji-can-frames)
+
+</details>
+
+<details><summary><b>DJI GM6020</b> — CAN</summary>
+
+- Motor: built in
+- Link: CAN, 1 Mbit/s
+- Command: current +-3 A, or voltage in raw counts
+- Feedback: angle, position, velocity
+- Examples (with a C620): ESP-IDF [dji](examples/esp/dji/), on the TWAI ·
+  STM32 HAL none
+- **GM6020 voltage mode is raw counts** (+-25000): the manual gives no
+  unit. Current mode needs motor firmware v1.0.11.2+ and is chosen per motor
+  at `dji_add()`.
+- Chip reference: [DJI CAN frames](docs/chips.md#dji-can-frames)
+
+</details>
+
+<details><summary><b>DJI C615</b> — PWM</summary>
+
+- Motor: Snail 2305 and others
+- Link: PWM, 400-2200 us, up to 500 Hz
+- Command: throttle 0..1
+- Feedback: none
+- Examples: ESP-IDF [c615](examples/esp/c615/), a throttle ramp on LEDC ·
+  STM32 HAL [c615](examples/stm/c615/main.c), four on TIM8 as on Hawk
+- **C615: no stop or idle pulse invented.** The app gives the endpoints it
+  calibrated the ESC to; the manual does not say which pulse stops it.
+- Chip reference: [C615](docs/chips.md#c615)
+
+</details>
+
+<details><summary><b>Haitai HT-03</b> — CAN</summary>
+
+- Motor: HT8108-J6, built in
+- Link: CAN, 1 Mbit/s, MIT protocol
+- Command: torque; the full MIT command
+- Feedback: position, velocity, torque
+- Examples: ESP-IDF [ht03](examples/esp/ht03/), esp-HT03's position hold ·
+  STM32 HAL none
+- **HT-03 checked against the STM32F446 rewrite** of the MIT firmware; the
+  HT-03 ships the older mbed one.
+- Chip reference: [Haitai HT-03](docs/chips.md#haitai-ht-03)
+
+</details>
+
+<details><summary><b>DShot ESCs</b> — DShot</summary>
+
+- Motor: any
+- Link: DShot150/300/600, up to 4: RMT on the ESP32-S2, S3, C3, C5, C6, H2, P4
+  (one motor on the ESP32, none on the C2); STM32 timer + DMA
+- Command: throttle 0..1, raw value, special commands
+- Feedback: bidirectional (300 and up): eRPM, RPM, velocity; with EDT
+  temperature, voltage, current, debug, status -- ESP32 RMT (2 motors on the
+  S2, C3, C5, C6, H2), STM32F4
+- Examples: ESP-IDF [dshot](examples/esp/dshot/), four on an S3's RMT: arm,
+  beep, ramp · STM32 HAL [dshot](examples/stm/dshot/main.c), four on TIM8 and
+  one DMA stream
+- Examples (bidirectional): ESP-IDF [dshot_bidir](examples/esp/dshot_bidir/),
+  two with EDT: RPM and temperature · STM32 HAL
+  [dshot_bidir](examples/stm/dshot_bidir/main.c), four on TIM8, sampling GPIOC
+- **Bidirectional DShot is host-tested, not yet run against an ESC.** The
+  reply is read on ESP-IDF's RMT and on the STM32F4 only (other STM32
+  families: `-EOPNOTSUPP`), one update late. The telemetry bit only asks:
+  the reply on the ESC's separate telemetry wire is not read.
+- Chip reference: [DShot](docs/chips.md#dshot)
+
+</details>
 
 ## Install
 
@@ -125,14 +220,7 @@ if (esc_get_feedback(wheel, &fb) == 0 && fb.online)
 
 ## Examples
 
-| Model | ESP-IDF | STM32 HAL |
-|---|---|---|
-| C620 + GM6020 | [dji](examples/esp/dji/), on the TWAI | -- |
-| C610 + C620 | -- | [dji_bxcan](examples/stm/dji_bxcan/main.c), on bxCAN |
-| HT-03 | [ht03](examples/esp/ht03/), esp-HT03's position hold | -- |
-| C615 | [c615](examples/esp/c615/), a throttle ramp on LEDC | [c615](examples/stm/c615/main.c), four on TIM8 as on Hawk |
-| DShot | [dshot](examples/esp/dshot/), four on an S3's RMT: arm, beep, ramp | [dshot](examples/stm/dshot/main.c), four on TIM8 and one DMA stream |
-| DShot, bidirectional | [dshot_bidir](examples/esp/dshot_bidir/), two with EDT: RPM and temperature | [dshot_bidir](examples/stm/dshot_bidir/main.c), four on TIM8, sampling GPIOC |
+Each driver's examples are listed under [Drivers](#drivers).
 
 ESP-IDF examples find this library and mcu-can through
 `EXTRA_COMPONENT_DIRS`, which assumes they are checked out side by side as
@@ -151,17 +239,6 @@ STM32 examples are snippets to integrate into your application.
 - **No feedback current in amperes from the DJI ESCs.** None of the three
   manuals gives the scale of the torque current they report; it is in
   `dji_get_raw()` as counts only.
-- **GM6020 voltage mode is raw counts** (+-25000): the manual gives no
-  unit. Current mode needs motor firmware v1.0.11.2+ and is chosen per motor
-  at `dji_add()`.
-- **C615: no stop or idle pulse invented.** The app gives the endpoints it
-  calibrated the ESC to; the manual does not say which pulse stops it.
-- **HT-03 checked against the STM32F446 rewrite** of the MIT firmware; the
-  HT-03 ships the older mbed one. See the [model reference](docs/chips.md#haitai-ht-03).
-- **Bidirectional DShot is host-tested, not yet run against an ESC.** The
-  reply is read on ESP-IDF's RMT and on the STM32F4 only (other STM32
-  families: `-EOPNOTSUPP`), one update late. The telemetry bit only asks:
-  the reply on the ESC's separate telemetry wire is not read.
 - **No locks.** One task per bus, or your own mutex.
 
 ## Documentation
