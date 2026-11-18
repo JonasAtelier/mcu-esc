@@ -21,6 +21,9 @@ CAN, so they bring in two libraries: this one, and
 ([why](#dependency-mcu-can)). The C615 and DShot models need no CAN and no
 mcu-can on the STM32. The reference follows the guides.
 
+**Arduino is not supported yet.** TODO: make the library usable from
+Arduino (Arduino IDE and PlatformIO).
+
 ## ESP-IDF, step by step
 
 **You need** ESP-IDF 5.2 or newer, with `idf.py` working in your terminal, and
