@@ -2,6 +2,8 @@
 # (scripts/menu.py) for the ESC_<MODEL> prompts. stm-forge has no Kconfig
 # build step: its build only sees the defconfig lines, as
 # -DCONFIG_ESC_<MODEL>=1 or 0. Every model is off unless set.
+# Outside ESP-IDF, CMakeLists.txt takes its options from the bool entries
+# here, found by their type line: keep `bool` directly under each `config`.
 menuconfig ESC
     bool "Brushless motor driver (ESC) subsystem"
     default y

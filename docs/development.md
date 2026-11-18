@@ -44,7 +44,8 @@ examples/
   esp/<name>/               ESP-IDF projects: dji, ht03, c615, dshot, dshot_bidir
   stm/<name>/               STM32 snippets: dji_bxcan, c615, dshot, dshot_bidir
 docs/                       the five guides; the manuals here are gitignored
-CMakeLists.txt              ESP-IDF only; stm-forge globs src/**/*.c instead
+CMakeLists.txt              ESP-IDF component; elsewhere a static library for add_subdirectory(); stm-forge globs src/**/*.c instead
+                            the static library's options are Kconfig's bool entries, found by the type line directly under each `config`
 Kconfig                     ESC and ESC_<MODEL>, for ESP-IDF and both forges' menus
 idf_component.yml           ESP-IDF component manifest
 LICENSE                     MIT
@@ -167,7 +168,10 @@ its own.
 3. Cite every identifier, range and byte to its manual in
    `src/foo/foo_proto.h`, and hold them in a `test_foo_math.c`.
 4. Add `CONFIG_ESC_FOO` to:
-   - the no-model checks in `CMakeLists.txt` and `src/esc_port_stm.c`;
+   - the no-model checks in `CMakeLists.txt` (its ESP-IDF part; the
+     `add_subdirectory()` part reads `Kconfig`) and `src/esc_port_stm.c`;
+   - a CAN model, the `add_subdirectory()` part's list of models that link
+     mcu-can;
    - a HAL module `#error` in `src/esc_priv.h`, if it needs one;
    - its sources in `CMakeLists.txt`;
    - `Kconfig`;

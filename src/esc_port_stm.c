@@ -16,13 +16,14 @@
 
 /*
  * The core is always built; each model's driver only under its own option.
- * With the library on and no model picked, say so -- stm-forge compiles
- * this file only when PKG_esc = y, so this is the CMakeLists' "on, no
- * model" warning on the ESP-IDF side.
+ * With the library built and no model picked, say so: this file is compiled
+ * only when the library is, so this is the CMakeLists' "no model" warning
+ * for every build that never reads that file (stm-forge, a hand-made
+ * project).
  */
 #if !(CONFIG_ESC_C610 || CONFIG_ESC_C620 || CONFIG_ESC_GM6020 || \
       CONFIG_ESC_C615 || CONFIG_ESC_HT03 || CONFIG_ESC_DSHOT)
-#warning "esc: no model is selected; set ESC_<MODEL> = y under PKG_esc = y (or -DCONFIG_ESC_<MODEL>=1)"
+#warning "esc: no model is selected; define CONFIG_ESC_<MODEL>=1 (stm-forge: ESC_<MODEL> = y)"
 #endif
 
 #if defined(HAL_I2C_MODULE_ENABLED) || defined(HAL_SPI_MODULE_ENABLED) || \
