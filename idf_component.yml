@@ -1,6 +1,6 @@
 version: "0.1.0"
 description: mcu-esc brushless motor driver subsystem for ESP-IDF and STM32 HAL, with the DJI C610, C620, GM6020 and C615 and the Haitai HT-03.
-license: MIT
+license: GPL-3.0-only
 dependencies:
   idf:
     version: ">=5.2"
